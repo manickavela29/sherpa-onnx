@@ -213,7 +213,7 @@ static Ort::SessionOptions GetSessionOptionsImpl(int32_t num_threads,
 
 Ort::SessionOptions GetSessionOptions(const OnlineModelConfig &config) {
   return GetSessionOptionsImpl(config.num_threads,
-        config.provider_config.provider,&config.provider_config);
+        config.transducer.encoder_config.provider);
 }
 
 Ort::SessionOptions GetSessionOptions(const OfflineModelConfig &config) {

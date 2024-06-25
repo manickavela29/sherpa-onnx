@@ -11,7 +11,7 @@
 #include "sherpa-onnx/csrc/online-transducer-model-config.h"
 #include "sherpa-onnx/csrc/online-wenet-ctc-model-config.h"
 #include "sherpa-onnx/csrc/online-zipformer2-ctc-model-config.h"
-#include "sherpa-onnx/csrc/provider-config.h"
+// #include "sherpa-onnx/csrc/provider-config.h"
 
 namespace sherpa_onnx {
 
@@ -21,7 +21,7 @@ struct OnlineModelConfig {
   OnlineWenetCtcModelConfig wenet_ctc;
   OnlineZipformer2CtcModelConfig zipformer2_ctc;
   OnlineNeMoCtcModelConfig nemo_ctc;
-  ProviderConfig provider_config;
+  std::string provider="cpu";
   std::string tokens;
   int32_t num_threads = 1;
   int32_t warm_up = 0;
@@ -46,27 +46,28 @@ struct OnlineModelConfig {
   std::string bpe_vocab;
 
   OnlineModelConfig() = default;
+  // OnlineModelConfig()
+  //     : transducer(provider) {}
   OnlineModelConfig(const OnlineTransducerModelConfig &transducer,
                     const OnlineParaformerModelConfig &paraformer,
                     const OnlineWenetCtcModelConfig &wenet_ctc,
                     const OnlineZipformer2CtcModelConfig &zipformer2_ctc,
                     const OnlineNeMoCtcModelConfig &nemo_ctc,
-                    const ProviderConfig &provider_config,
                     const std::string &tokens, int32_t num_threads,
                     int32_t warm_up, bool debug, const std::string &provider,
                     const std::string &model_type,
                     const std::string &modeling_unit,
                     const std::string &bpe_vocab)
-      : transducer(transducer),
+      : transducer(provider),
         paraformer(paraformer),
         wenet_ctc(wenet_ctc),
         zipformer2_ctc(zipformer2_ctc),
         nemo_ctc(nemo_ctc),
-        provider_config(provider_config),
         tokens(tokens),
         num_threads(num_threads),
         warm_up(warm_up),
         debug(debug),
+        provider(provider),
         model_type(model_type),
         modeling_unit(modeling_unit),
         bpe_vocab(bpe_vocab) {}

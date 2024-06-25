@@ -11,12 +11,21 @@
 namespace sherpa_onnx {
 
 void OnlineTransducerModelConfig::Register(ParseOptions *po) {
+  // SHERPA_ONNX_LOGE("Printing confs in transducer %s : %s",encoder_config.ToString().c_str());
+  encoder_config.Register(po);
+  decoder_config.Register(po);
+  joiner_config.Register(po);
+
   po->Register("encoder", &encoder, "Path to encoder.onnx");
   po->Register("decoder", &decoder, "Path to decoder.onnx");
   po->Register("joiner", &joiner, "Path to joiner.onnx");
+    std::ostringstream os;
+  po->PrintConfig(os);
+  SHERPA_ONNX_LOGE("Args : %s",os.str().c_str());
 }
 
 bool OnlineTransducerModelConfig::Validate() const {
+  SHERPA_ONNX_LOGE("Provider at transducer : %s\n",provider.c_str());
   if (!FileExists(encoder)) {
     SHERPA_ONNX_LOGE("transducer encoder: '%s' does not exist",
                      encoder.c_str());
@@ -43,7 +52,10 @@ std::string OnlineTransducerModelConfig::ToString() const {
   os << "OnlineTransducerModelConfig(";
   os << "encoder=\"" << encoder << "\", ";
   os << "decoder=\"" << decoder << "\", ";
-  os << "joiner=\"" << joiner << "\")";
+  os << "joiner=\"" << joiner << "\", ";;
+  os << "encoder_config=\"" << encoder_config.ToString() << "\", ";
+  os << "decoder_config=\"" << decoder_config.ToString() << "\", ";
+  os << "joiner_config=\"" << joiner_config.ToString() << "\")";
 
   return os.str();
 }
