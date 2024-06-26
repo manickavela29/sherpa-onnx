@@ -430,11 +430,19 @@ OnlineZipformer2TransducerModel::RunEncoder(Ort::Value features,
     encoder_inputs.push_back(std::move(v));
   }
 
+#ifdef SHERPA_ONNX_PROFILE
+  auto t_start = Time::now();
+#endif
   auto encoder_out = encoder_sess_->Run(
       {}, encoder_input_names_ptr_.data(), encoder_inputs.data(),
       encoder_inputs.size(), encoder_output_names_ptr_.data(),
       encoder_output_names_ptr_.size());
-
+#ifdef SHERPA_ONNX_PROFILE
+  auto t_stop = Time::now();
+  auto elapsed_time = duration_cast<ms>(t_stop - t_start);
+  long long milliseconds = elapsed_time.count();
+  SHERPA_ONNX_LOGE("Encoder : %ll ms",millliseconds);
+#endif
   std::vector<Ort::Value> next_states;
   next_states.reserve(states.size());
 

@@ -10,8 +10,15 @@
 #include <mutex>  // NOLINT
 #include <sstream>
 #include <string>
+#include <chrono>
 
 namespace sherpa_onnx {
+
+#if SHERPA_ONNX_PROFILE
+typedef std::chrono::high_resolution_clock Time;
+typedef std::chrono::milliseconds ms;
+typedef std::chrono::duration_cast duration_cast;
+#endif
 
 #if SHERPA_ONNX_ENABLE_CHECK
 
