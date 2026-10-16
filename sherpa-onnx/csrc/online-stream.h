@@ -17,6 +17,7 @@
 #include "sherpa-onnx/csrc/online-paraformer-decoder.h"
 #include "sherpa-onnx/csrc/online-stream-state.h"
 #include "sherpa-onnx/csrc/online-transducer-decoder.h"
+#include "sherpa-onnx/csrc/vad-model-config.h"
 
 namespace sherpa_onnx {
 
@@ -132,6 +133,36 @@ class OnlineStream {
   int32_t GetOptionInt(const std::string &key, int32_t default_value = 0) const;
   float GetOptionFloat(const std::string &key,
                        float default_value = 0.0f) const;
+
+  // ---- Independent, per-stream Silero VAD (optional) ----
+  //
+  // Unrelated to the ASR feature pipeline: this VAD has its own ONNX
+  // session, its own resampling of the waveform passed to
+  // AcceptWaveform(), and its own speech/silence state. Call once, right
+  // after creating the stream, only if you want VAD-driven endpointing.
+
+  // Creates the online VAD for this stream from `vad_config`
+  // (`vad_config.silero_vad.model` must be non-empty).
+  void InitOnlineVad(const VadModelConfig &vad_config);
+
+  // True if InitOnlineVad() was called on this stream.
+  bool HasOnlineVad() const;
+
+  // True if the online VAD currently considers this stream to contain
+  // speech (sticky through its own min-silence-duration hangover).
+  bool IsOnlineVadSpeechDetected() const;
+
+  // True once this stream has seen speech and the online VAD has since
+  // observed enough trailing silence (its min_silence_duration) to end
+  // it. This is the VAD-driven endpoint signal. Cleared by
+  // ResetOnlineVad().
+  bool IsOnlineVadEndpoint() const;
+
+  // Clears the "seen speech this segment" bookkeeping so a new endpoint
+  // requires fresh speech first. Does not drop the VAD's own internal
+  // buffering/resampler state, which keeps running continuously across
+  // segments (mirrors how Reset() does not reset the feature extractor).
+  void ResetOnlineVad();
 
  private:
   class Impl;

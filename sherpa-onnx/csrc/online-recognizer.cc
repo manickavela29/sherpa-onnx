@@ -91,6 +91,7 @@ void OnlineRecognizerConfig::Register(ParseOptions *po) {
   endpoint_config.Register(po);
   lm_config.Register(po);
   ctc_fst_decoder_config.Register(po);
+  online_vad_config.Register(po);
   hr.Register(po);
 
   po->Register("enable-endpoint", &enable_endpoint,
@@ -192,6 +193,11 @@ bool OnlineRecognizerConfig::Validate() const {
     return false;
   }
 
+  if (online_vad_config.IsEnabled() && !online_vad_config.Validate()) {
+    SHERPA_ONNX_LOGE("Errors in online_vad_config");
+    return false;
+  }
+
   return model_config.Validate();
 }
 
@@ -204,6 +210,7 @@ std::string OnlineRecognizerConfig::ToString() const {
   os << "lm_config=" << lm_config.ToString() << ", ";
   os << "endpoint_config=" << endpoint_config.ToString() << ", ";
   os << "ctc_fst_decoder_config=" << ctc_fst_decoder_config.ToString() << ", ";
+  os << "online_vad_config=" << online_vad_config.ToString() << ", ";
   os << "enable_endpoint=" << (enable_endpoint ? "True" : "False") << ", ";
   os << "max_active_paths=" << max_active_paths << ", ";
   os << "hotwords_score=" << hotwords_score << ", ";
@@ -220,22 +227,32 @@ std::string OnlineRecognizerConfig::ToString() const {
 }
 
 OnlineRecognizer::OnlineRecognizer(const OnlineRecognizerConfig &config)
-    : impl_(OnlineRecognizerImpl::Create(config)) {}
+    : impl_(OnlineRecognizerImpl::Create(config)),
+      online_vad_config_(config.online_vad_config) {}
 
 template <typename Manager>
 OnlineRecognizer::OnlineRecognizer(Manager *mgr,
                                    const OnlineRecognizerConfig &config)
-    : impl_(OnlineRecognizerImpl::Create(mgr, config)) {}
+    : impl_(OnlineRecognizerImpl::Create(mgr, config)),
+      online_vad_config_(config.online_vad_config) {}
 
 OnlineRecognizer::~OnlineRecognizer() = default;
 
 std::unique_ptr<OnlineStream> OnlineRecognizer::CreateStream() const {
-  return impl_->CreateStream();
+  auto s = impl_->CreateStream();
+  if (online_vad_config_.IsEnabled()) {
+    s->InitOnlineVad(online_vad_config_.ToVadModelConfig());
+  }
+  return s;
 }
 
 std::unique_ptr<OnlineStream> OnlineRecognizer::CreateStream(
     const std::string &hotwords) const {
-  return impl_->CreateStream(hotwords);
+  auto s = impl_->CreateStream(hotwords);
+  if (online_vad_config_.IsEnabled()) {
+    s->InitOnlineVad(online_vad_config_.ToVadModelConfig());
+  }
+  return s;
 }
 
 bool OnlineRecognizer::IsReady(OnlineStream *s) const {
@@ -259,10 +276,18 @@ OnlineRecognizerResult OnlineRecognizer::GetResult(OnlineStream *s) const {
 }
 
 bool OnlineRecognizer::IsEndpoint(OnlineStream *s) const {
+  if (s->HasOnlineVad() && s->IsOnlineVadEndpoint()) {
+    return true;
+  }
   return impl_->IsEndpoint(s);
 }
 
-void OnlineRecognizer::Reset(OnlineStream *s) const { impl_->Reset(s); }
+void OnlineRecognizer::Reset(OnlineStream *s) const {
+  impl_->Reset(s);
+  if (s->HasOnlineVad()) {
+    s->ResetOnlineVad();
+  }
+}
 
 #if __ANDROID_API__ >= 9
 template OnlineRecognizer::OnlineRecognizer(

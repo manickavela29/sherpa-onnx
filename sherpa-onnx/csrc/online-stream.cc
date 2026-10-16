@@ -10,8 +10,10 @@
 #include <vector>
 
 #include "sherpa-onnx/csrc/features.h"
+#include "sherpa-onnx/csrc/resample.h"
 #include "sherpa-onnx/csrc/text-utils.h"
 #include "sherpa-onnx/csrc/transducer-keyword-decoder.h"
+#include "sherpa-onnx/csrc/voice-activity-detector.h"
 
 namespace sherpa_onnx {
 
@@ -24,11 +26,42 @@ class OnlineStream::Impl {
   void AcceptWaveform(int32_t sampling_rate, const float *waveform, int32_t n) {
     std::lock_guard<std::mutex> lock(mutex_);
     feat_extractor_.AcceptWaveform(sampling_rate, waveform, n);
+
+    if (online_vad_) {
+      const float *vad_waveform = waveform;
+      int32_t vad_n = n;
+      std::vector<float> resampled;
+
+      if (sampling_rate != online_vad_sample_rate_) {
+        if (!online_vad_resampler_ ||
+            online_vad_resampler_->GetInputSamplingRate() != sampling_rate) {
+          float min_freq =
+              std::min<int32_t>(sampling_rate, online_vad_sample_rate_);
+          float lowpass_cutoff = 0.99f * 0.5f * min_freq;
+          online_vad_resampler_ = std::make_unique<LinearResample>(
+              sampling_rate, online_vad_sample_rate_, lowpass_cutoff, 6);
+        }
+        online_vad_resampler_->Resample(waveform, n, false, &resampled);
+        vad_waveform = resampled.data();
+        vad_n = static_cast<int32_t>(resampled.size());
+      }
+
+      if (vad_n > 0) {
+        online_vad_->AcceptWaveform(vad_waveform, vad_n);
+      }
+
+      if (online_vad_->IsSpeechDetected()) {
+        online_vad_had_speech_ = true;
+      }
+    }
   }
 
   void InputFinished() const {
     std::lock_guard<std::mutex> lock(mutex_);
     feat_extractor_.InputFinished();
+    if (online_vad_) {
+      online_vad_->Flush();
+    }
   }
 
   int32_t NumFramesReady() const {
@@ -51,6 +84,33 @@ class OnlineStream::Impl {
     // we don't reset the feature extractor
     start_frame_index_ += num_processed_frames_;
     num_processed_frames_ = 0;
+  }
+
+  void InitOnlineVad(const VadModelConfig &vad_config) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    online_vad_sample_rate_ = vad_config.sample_rate;
+    online_vad_ = std::make_unique<VoiceActivityDetector>(vad_config);
+  }
+
+  bool HasOnlineVad() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return online_vad_ != nullptr;
+  }
+
+  bool IsOnlineVadSpeechDetected() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return online_vad_ && online_vad_->IsSpeechDetected();
+  }
+
+  bool IsOnlineVadEndpoint() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return online_vad_ && online_vad_had_speech_ &&
+           !online_vad_->IsSpeechDetected();
+  }
+
+  void ResetOnlineVad() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    online_vad_had_speech_ = false;
   }
 
   int32_t &GetNumProcessedFrames() {
@@ -226,6 +286,13 @@ class OnlineStream::Impl {
   std::unordered_map<std::string, std::string> options_;
   std::unique_ptr<kaldi_decoder::FasterDecoder> faster_decoder_;
   int32_t faster_decoder_processed_frames_ = 0;
+
+  // Independent, per-stream Silero VAD (optional; null unless
+  // InitOnlineVad() was called).
+  std::unique_ptr<VoiceActivityDetector> online_vad_;
+  std::unique_ptr<LinearResample> online_vad_resampler_;
+  int32_t online_vad_sample_rate_ = 16000;
+  bool online_vad_had_speech_ = false;
 };
 
 OnlineStream::OnlineStream(const FeatureExtractorConfig &config /*= {}*/,
@@ -392,5 +459,21 @@ float OnlineStream::GetOptionFloat(const std::string &key,
                                    float default_value) const {
   return impl_->GetOptionFloat(key, default_value);
 }
+
+void OnlineStream::InitOnlineVad(const VadModelConfig &vad_config) {
+  impl_->InitOnlineVad(vad_config);
+}
+
+bool OnlineStream::HasOnlineVad() const { return impl_->HasOnlineVad(); }
+
+bool OnlineStream::IsOnlineVadSpeechDetected() const {
+  return impl_->IsOnlineVadSpeechDetected();
+}
+
+bool OnlineStream::IsOnlineVadEndpoint() const {
+  return impl_->IsOnlineVadEndpoint();
+}
+
+void OnlineStream::ResetOnlineVad() { impl_->ResetOnlineVad(); }
 
 }  // namespace sherpa_onnx

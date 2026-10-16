@@ -17,6 +17,7 @@
 #include "sherpa-onnx/csrc/online-model-config.h"
 #include "sherpa-onnx/csrc/online-stream.h"
 #include "sherpa-onnx/csrc/online-transducer-model-config.h"
+#include "sherpa-onnx/csrc/online-vad-model-config.h"
 #include "sherpa-onnx/csrc/parse-options.h"
 
 namespace sherpa_onnx {
@@ -97,6 +98,10 @@ struct OnlineRecognizerConfig {
   OnlineLMConfig lm_config;
   EndpointConfig endpoint_config;
   OnlineCtcFstDecoderConfig ctc_fst_decoder_config;
+
+  // Optional, independent Silero VAD running alongside ASR decoding; see
+  // OnlineVadModelConfig. Disabled (default) when its `model` is empty.
+  OnlineVadModelConfig online_vad_config;
 
   bool enable_endpoint = true;
 
@@ -235,6 +240,7 @@ class OnlineRecognizer {
 
  private:
   std::unique_ptr<OnlineRecognizerImpl> impl_;
+  OnlineVadModelConfig online_vad_config_;
 };
 
 }  // namespace sherpa_onnx
