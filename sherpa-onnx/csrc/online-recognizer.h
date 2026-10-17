@@ -71,6 +71,20 @@ struct OnlineRecognizerResult {
   /// initialization of this struct keeps working.
   int32_t num_trailing_blanks = 0;
 
+  /// Which endpoint rule fired for this result: 0 none, 1 blank-based
+  /// (rule1/2/3, undistinguished), 4 VAD-based (only possible when an
+  /// online VAD is configured, see OnlineRecognizerConfig::online_vad_config).
+  int32_t endpoint_rule = 0;
+
+  /// Seconds between the VAD-based endpoint firing and the VAD's last
+  /// scored speech frame. Only meaningful when endpoint_rule == 4; 0
+  /// otherwise.
+  float endpoint_delay = 0;
+
+  /// Stream time (seconds) at which the online VAD last scored speech for
+  /// this segment. Only meaningful when endpoint_rule == 4; 0 otherwise.
+  float speech_end_time = 0;
+
   /** Return a json string.
    *
    * The returned string contains:
@@ -84,6 +98,9 @@ struct OnlineRecognizerResult {
    *     "segment": x,
    *     "words": [x, x, x],
    *     "num_trailing_blanks": x,
+   *     "endpoint_rule": x,
+   *     "endpoint_delay": x,
+   *     "speech_end_time": x,
    *     "start_time": x,
    *     "is_final": true|false
    *     "is_eof": true|false
@@ -205,6 +222,18 @@ class OnlineRecognizer {
    */
   bool IsReady(OnlineStream *s) const;
 
+  // When an online VAD is configured on this stream and the current
+  // model's chunk-shift is known for VAD purposes (see
+  // OnlineRecognizerImpl::GetChunkShiftForVad()), fast-forwards
+  // s->GetNumProcessedFrames() over any VAD-confirmed trailing silence
+  // that fully covers the next ASR chunk, so the encoder is never run on
+  // it. A no-op otherwise (including when no online VAD is configured,
+  // or the model doesn't support it -- e.g. Paraformer). Called
+  // automatically from IsReady(); exposed publicly so callers with their
+  // own decode scheduling (e.g. the websocket server) can invoke it
+  // directly once per tick instead.
+  void MaybeSkipVadSilence(OnlineStream *s) const;
+
   /** Decode a single stream. */
   void DecodeStream(OnlineStream *s) const {
     OnlineStream *ss[1] = {s};
@@ -241,6 +270,7 @@ class OnlineRecognizer {
  private:
   std::unique_ptr<OnlineRecognizerImpl> impl_;
   OnlineVadModelConfig online_vad_config_;
+  float asr_frame_shift_ms_ = 10.0f;
 };
 
 }  // namespace sherpa_onnx

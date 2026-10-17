@@ -56,6 +56,14 @@ void OnlineVadModelConfig::Register(ParseOptions *po) {
   po->Register("online-vad-debug", &debug,
                "true to display debug information when loading the online "
                "VAD model");
+
+  po->Register("online-vad-defer-inference", &defer_inference,
+               "Advanced/internal. If true, Silero inference only runs "
+               "when something explicitly drives it (e.g. a dedicated "
+               "timer), instead of inline inside AcceptWaveform(). The "
+               "websocket server sets this on its own internal recognizer "
+               "config; don't set it by hand unless you're also driving "
+               "OnlineStream::RunOnlineVad() yourself.");
 }
 
 bool OnlineVadModelConfig::Validate() const {
@@ -119,7 +127,8 @@ std::string OnlineVadModelConfig::ToString() const {
   os << "sample_rate=" << sample_rate << ", ";
   os << "num_threads=" << num_threads << ", ";
   os << "provider=\"" << provider << "\", ";
-  os << "debug=" << (debug ? "True" : "False") << ")";
+  os << "debug=" << (debug ? "True" : "False") << ", ";
+  os << "defer_inference=" << (defer_inference ? "True" : "False") << ")";
   return os.str();
 }
 

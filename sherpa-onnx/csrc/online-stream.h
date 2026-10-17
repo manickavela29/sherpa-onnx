@@ -142,8 +142,17 @@ class OnlineStream {
   // after creating the stream, only if you want VAD-driven endpointing.
 
   // Creates the online VAD for this stream from `vad_config`
-  // (`vad_config.silero_vad.model` must be non-empty).
-  void InitOnlineVad(const VadModelConfig &vad_config);
+  // (`vad_config.silero_vad.model` must be non-empty). `asr_frame_shift_ms`
+  // is the ASR feature pipeline's frame shift, used to convert VAD-scored
+  // sample counts into ASR-frame-equivalent units for the coverage gate
+  // and batch-skip. `defer_inference`, when true, makes AcceptWaveform()
+  // only buffer samples for the VAD -- actual Silero inference only runs
+  // when something calls RunOnlineVad() explicitly (e.g. a dedicated
+  // timer). When false (the default for every caller except the
+  // websocket server), AcceptWaveform() runs VAD inference inline, same
+  // as before this flag existed.
+  void InitOnlineVad(const VadModelConfig &vad_config, float asr_frame_shift_ms,
+                     bool defer_inference = false);
 
   // True if InitOnlineVad() was called on this stream.
   bool HasOnlineVad() const;
@@ -163,6 +172,43 @@ class OnlineStream {
   // buffering/resampler state, which keeps running continuously across
   // segments (mirrors how Reset() does not reset the feature extractor).
   void ResetOnlineVad();
+
+  // When InitOnlineVad(..., defer_inference=true) was used, actually runs
+  // Silero inference on whatever samples AcceptWaveform() has buffered
+  // since the last call, updating the VAD's speech/silence state and
+  // coverage counters. A no-op if nothing is pending, if deferred
+  // inference wasn't requested (inline mode already did this inside
+  // AcceptWaveform), or if no online VAD was configured.
+  void RunOnlineVad();
+
+  // Total ASR-feature-frame-equivalent audio the online VAD has actually
+  // scored so far, in the same absolute frame space as
+  // GetNumFramesSinceStart() + GetNumProcessedFrames() (i.e. never reset
+  // by Reset()/ResetOnlineVad()). 0 if no online VAD is configured.
+  int64_t GetOnlineVadFramesCoveredAbsolute() const;
+
+  // True + the absolute frame (same space as above) where the VAD's
+  // current confirmed-silence run began, if the VAD is presently silent
+  // and a silence run has actually started this stream. False (output
+  // untouched) otherwise.
+  bool GetOnlineVadConfirmedSilenceStartAbsolute(int64_t *out_frame) const;
+
+  // True once InputFinished() has been called on this stream.
+  bool IsInputFinished() const;
+
+  // Which endpoint rule last fired for this stream's current segment: 0
+  // none, 1 blank-based (rule1/2/3, undistinguished), 4 VAD-based. Reset
+  // to 0 by OnlineRecognizer::Reset(). Returned reference is valid as
+  // long as this object is alive.
+  int32_t &GetEndpointRule();
+
+  // Seconds between the VAD-based endpoint firing and the VAD's last
+  // scored speech frame; only meaningful when GetEndpointRule() == 4.
+  float &GetEndpointDelay();
+
+  // Stream time (seconds) at which the VAD last scored speech for the
+  // current segment; only meaningful when GetEndpointRule() == 4.
+  float &GetSpeechEndTime();
 
  private:
   class Impl;

@@ -63,6 +63,15 @@ struct OnlineVadModelConfig {
 
   bool debug = false;
 
+  // Advanced/internal: when true, OnlineStream::AcceptWaveform() only
+  // buffers samples for the VAD; actual Silero inference only runs when
+  // something calls OnlineStream::RunOnlineVad() explicitly (e.g. a
+  // dedicated timer, as the websocket server uses). Leave this false
+  // (the default) unless you're also driving RunOnlineVad() yourself --
+  // the websocket server sets this automatically and doesn't expose it
+  // as a user-facing flag.
+  bool defer_inference = false;
+
   OnlineVadModelConfig() = default;
 
   void Register(ParseOptions *po);

@@ -89,6 +89,19 @@ class OnlineRecognizerTransducerNeMoParakeetUnifiedImpl
     return ready > processed && s->IsLastFrame(ready - 1);
   }
 
+  // The "flush at end of input" branch above advances by less than
+  // ChunkFeatureFrames() when little audio is left; MaybeSkipVadSilence
+  // and the IsReady() coverage gate already bypass VAD entirely once
+  // OnlineStream::IsInputFinished() is true, so that branch is never
+  // reached while these are in effect -- ChunkFeatureFrames() is a safe,
+  // fixed shift for VAD purposes.
+  int32_t GetChunkSizeForVad() const override {
+    return model_->ChunkFeatureFrames();
+  }
+  int32_t GetChunkShiftForVad() const override {
+    return model_->ChunkFeatureFrames();
+  }
+
   OnlineRecognizerResult GetResult(OnlineStream *s) const override {
     int32_t frame_shift_ms = 10;
     int32_t subsampling_factor = model_->SubsamplingFactor();

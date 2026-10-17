@@ -77,6 +77,11 @@ std::string OnlineRecognizerResult::AsJsonString() const {
   os << "\"segment\": " << segment << ", ";
   os << "\"words\": " << VecToString(words, 0) << ", ";
   os << "\"num_trailing_blanks\": " << num_trailing_blanks << ", ";
+  os << "\"endpoint_rule\": " << endpoint_rule << ", ";
+  os << "\"endpoint_delay\": " << std::fixed << std::setprecision(2)
+     << endpoint_delay << ", ";
+  os << "\"speech_end_time\": " << std::fixed << std::setprecision(2)
+     << speech_end_time << ", ";
   os << "\"start_time\": " << std::fixed << std::setprecision(2) << start_time
      << ", ";
   os << "\"is_final\": " << (is_final ? "true" : "false") << ", ";
@@ -228,20 +233,24 @@ std::string OnlineRecognizerConfig::ToString() const {
 
 OnlineRecognizer::OnlineRecognizer(const OnlineRecognizerConfig &config)
     : impl_(OnlineRecognizerImpl::Create(config)),
-      online_vad_config_(config.online_vad_config) {}
+      online_vad_config_(config.online_vad_config),
+      asr_frame_shift_ms_(config.feat_config.frame_shift_ms) {}
 
 template <typename Manager>
 OnlineRecognizer::OnlineRecognizer(Manager *mgr,
                                    const OnlineRecognizerConfig &config)
     : impl_(OnlineRecognizerImpl::Create(mgr, config)),
-      online_vad_config_(config.online_vad_config) {}
+      online_vad_config_(config.online_vad_config),
+      asr_frame_shift_ms_(config.feat_config.frame_shift_ms) {}
 
 OnlineRecognizer::~OnlineRecognizer() = default;
 
 std::unique_ptr<OnlineStream> OnlineRecognizer::CreateStream() const {
   auto s = impl_->CreateStream();
   if (online_vad_config_.IsEnabled()) {
-    s->InitOnlineVad(online_vad_config_.ToVadModelConfig());
+    s->InitOnlineVad(online_vad_config_.ToVadModelConfig(),
+                     asr_frame_shift_ms_,
+                     online_vad_config_.defer_inference);
   }
   return s;
 }
@@ -250,13 +259,64 @@ std::unique_ptr<OnlineStream> OnlineRecognizer::CreateStream(
     const std::string &hotwords) const {
   auto s = impl_->CreateStream(hotwords);
   if (online_vad_config_.IsEnabled()) {
-    s->InitOnlineVad(online_vad_config_.ToVadModelConfig());
+    s->InitOnlineVad(online_vad_config_.ToVadModelConfig(),
+                     asr_frame_shift_ms_,
+                     online_vad_config_.defer_inference);
   }
   return s;
 }
 
 bool OnlineRecognizer::IsReady(OnlineStream *s) const {
-  return impl_->IsReady(s);
+  bool ready = impl_->IsReady(s);
+  if (!ready || !s->HasOnlineVad() || s->IsInputFinished()) {
+    return ready;
+  }
+
+  MaybeSkipVadSilence(s);
+
+  int32_t chunk_size = impl_->GetChunkSizeForVad();
+  if (chunk_size <= 0) {
+    // This decoder impl doesn't support VAD-coverage gating (e.g.
+    // Paraformer) -- fall back to the blank-frame-count readiness check
+    // only.
+    return ready;
+  }
+
+  int64_t target = static_cast<int64_t>(s->GetNumFramesSinceStart()) +
+                   s->GetNumProcessedFrames() + chunk_size;
+  return s->GetOnlineVadFramesCoveredAbsolute() >= target;
+}
+
+void OnlineRecognizer::MaybeSkipVadSilence(OnlineStream *s) const {
+  if (!s->HasOnlineVad() || s->IsInputFinished()) {
+    return;
+  }
+
+  int32_t chunk_size = impl_->GetChunkSizeForVad();
+  int32_t chunk_shift = impl_->GetChunkShiftForVad();
+  if (chunk_size <= 0 || chunk_shift <= 0) {
+    return;
+  }
+
+  int64_t silence_start = 0;
+  if (!s->GetOnlineVadConfirmedSilenceStartAbsolute(&silence_start)) {
+    return;
+  }
+  int64_t vad_covered = s->GetOnlineVadFramesCoveredAbsolute();
+
+  // While the *next* ASR chunk window is fully inside the VAD's
+  // confirmed-silence range (and the VAD has actually scored that far),
+  // fast-forward over it so the encoder is never run on it.
+  while (true) {
+    int64_t window_start =
+        static_cast<int64_t>(s->GetNumFramesSinceStart()) +
+        s->GetNumProcessedFrames();
+    int64_t window_end = window_start + chunk_size;
+    if (window_start < silence_start || window_end > vad_covered) {
+      break;
+    }
+    s->GetNumProcessedFrames() += chunk_shift;
+  }
 }
 
 void OnlineRecognizer::WarmpUpRecognizer(int32_t warmup, int32_t mbs) const {
@@ -272,14 +332,35 @@ void OnlineRecognizer::DecodeStreams(OnlineStream **ss, int32_t n) const {
 OnlineRecognizerResult OnlineRecognizer::GetResult(OnlineStream *s) const {
   auto r = impl_->GetResult(s);
   r.text = RemoveLeadingSpaces(r.text);
+  r.endpoint_rule = s->GetEndpointRule();
+  r.endpoint_delay = s->GetEndpointDelay();
+  r.speech_end_time = s->GetSpeechEndTime();
   return r;
 }
 
 bool OnlineRecognizer::IsEndpoint(OnlineStream *s) const {
   if (s->HasOnlineVad() && s->IsOnlineVadEndpoint()) {
+    s->GetEndpointRule() = 4;
+
+    int64_t covered = s->GetOnlineVadFramesCoveredAbsolute();
+    int64_t last_speech = 0;
+    bool had_speech =
+        s->GetOnlineVadConfirmedSilenceStartAbsolute(&last_speech);
+    // GetOnlineVadConfirmedSilenceStartAbsolute() returns the frame where
+    // the confirmed-silence run started, which is also the last frame the
+    // VAD had scored as speech.
+    float frame_shift_s = asr_frame_shift_ms_ / 1000.0f;
+    if (had_speech) {
+      s->GetSpeechEndTime() = last_speech * frame_shift_s;
+      s->GetEndpointDelay() = (covered - last_speech) * frame_shift_s;
+    }
     return true;
   }
-  return impl_->IsEndpoint(s);
+  if (impl_->IsEndpoint(s)) {
+    s->GetEndpointRule() = 1;
+    return true;
+  }
+  return false;
 }
 
 void OnlineRecognizer::Reset(OnlineStream *s) const {
@@ -287,6 +368,9 @@ void OnlineRecognizer::Reset(OnlineStream *s) const {
   if (s->HasOnlineVad()) {
     s->ResetOnlineVad();
   }
+  s->GetEndpointRule() = 0;
+  s->GetEndpointDelay() = 0;
+  s->GetSpeechEndTime() = 0;
 }
 
 #if __ANDROID_API__ >= 9
