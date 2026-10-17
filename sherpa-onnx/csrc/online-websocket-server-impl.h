@@ -69,6 +69,11 @@ struct OnlineWebsocketDecoderConfig {
   // the server will resample internally.
   int32_t input_sample_rate = 16000;
 
+  // How often the independent VAD tick runs. Only meaningful when
+  // recognizer_config.online_vad_config.model is set -- otherwise no VAD
+  // timer is armed at all.
+  int32_t vad_loop_interval_ms = 20;
+
   void Register(ParseOptions *po);
   void Validate() const;
 };
@@ -94,6 +99,11 @@ class OnlineWebsocketDecoder {
 
   void Run();
 
+  // Starts the independent VAD timer loop. A no-op (never arms
+  // vad_timer_) if recognizer_config.online_vad_config.model is empty.
+  // Call alongside Run(), not instead of it.
+  void RunVad();
+
  private:
   void ProcessConnections(const asio::error_code &ec);
 
@@ -101,11 +111,19 @@ class OnlineWebsocketDecoder {
    */
   void Decode();
 
+  // Ticks the independent VAD pipeline: scores whatever audio has been
+  // buffered for each connection's VAD since the last tick, and streams
+  // a low-cadence empty result to clients that haven't started speaking
+  // yet. Runs on the io_vad_ timer thread itself (no further posting to
+  // a separate pool in this version).
+  void ProcessVadConnections(const asio::error_code &ec);
+
  private:
   OnlineWebsocketServer *server_;  // not owned
   std::unique_ptr<OnlineRecognizer> recognizer_;
   OnlineWebsocketDecoderConfig config_;
   asio::steady_timer timer_;
+  asio::steady_timer vad_timer_;
 
   // It protects `connections_`, `ready_connections_`, and `active_`
   std::mutex mutex_;
@@ -136,6 +154,7 @@ class OnlineWebsocketServer {
  public:
   explicit OnlineWebsocketServer(asio::io_context &io_conn,  // NOLINT
                                  asio::io_context &io_work,  // NOLINT
+                                 asio::io_context &io_vad,   // NOLINT
                                  const OnlineWebsocketServerConfig &config);
 
   void Run(uint16_t port);
@@ -143,6 +162,7 @@ class OnlineWebsocketServer {
   const OnlineWebsocketServerConfig &GetConfig() const { return config_; }
   asio::io_context &GetConnectionContext() { return io_conn_; }
   asio::io_context &GetWorkContext() { return io_work_; }
+  asio::io_context &GetVadContext() { return io_vad_; }
   server &GetServer() { return server_; }
 
   void Send(connection_hdl hdl, const std::string &text);
@@ -169,6 +189,7 @@ class OnlineWebsocketServer {
   OnlineWebsocketServerConfig config_;
   asio::io_context &io_conn_;
   asio::io_context &io_work_;
+  asio::io_context &io_vad_;
   server server_;
 
   std::ofstream log_;
