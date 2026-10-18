@@ -64,7 +64,19 @@ class OnlineStream::Impl {
     input_finished_ = true;
     if (online_vad_) {
       DrainOnlineVadLocked();
+      // VoiceActivityDetector::Flush() force-closes an in-progress
+      // speech segment at end-of-input even if natural trailing
+      // silence (min_silence_duration) never accumulated -- e.g. a
+      // call that hangs up right after the last word. That's a state
+      // transition ScoreOnlineVad()'s own before/after check can't see
+      // (Flush() isn't routed through it), so track it here explicitly
+      // or online_vad_silence_start_sample_ would never get set for
+      // this (common) end-of-call case.
+      bool was_speech = online_vad_->IsSpeechDetected();
       online_vad_->Flush();
+      if (was_speech && !online_vad_->IsSpeechDetected()) {
+        online_vad_silence_start_sample_ = online_vad_samples_scored_;
+      }
     }
   }
 
@@ -126,7 +138,8 @@ class OnlineStream::Impl {
     bool was_speech = online_vad_->IsSpeechDetected();
     online_vad_->AcceptWaveform(data, n);
     online_vad_samples_scored_ += n;
-    if (online_vad_->IsSpeechDetected()) {
+    bool is_speech = online_vad_->IsSpeechDetected();
+    if (is_speech) {
       online_vad_had_speech_ = true;
       online_vad_last_speech_sample_ = online_vad_samples_scored_;
     } else if (was_speech) {
@@ -143,31 +156,21 @@ class OnlineStream::Impl {
   }
 
   void RunOnlineVad() {
-    std::vector<float> pending;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (!online_vad_ || online_vad_pending_samples_.empty()) return;
-      std::swap(pending, online_vad_pending_samples_);
-    }
-
-    // Runs the actual Silero inference without mutex_ held, so
-    // AcceptWaveform() on another thread can keep buffering new samples
-    // concurrently. online_vad_ itself has no internal locking, so this
-    // relies on RunOnlineVad() never being called concurrently with
-    // itself for the same stream (the caller -- a single dedicated VAD
-    // timer thread -- is responsible for that).
-    bool was_speech = online_vad_->IsSpeechDetected();
-    online_vad_->AcceptWaveform(pending.data(),
-                                static_cast<int32_t>(pending.size()));
-
+    // Holds mutex_ for the whole call, including the actual inference:
+    // online_vad_ (VoiceActivityDetector/SileroVadModel) has no internal
+    // locking of its own, and InputFinished() -> DrainOnlineVadLocked()
+    // also calls into it (to score trailing audio before Flush()).
+    // Without one lock covering every call into online_vad_, those two
+    // call sites could run concurrently on different threads (the VAD
+    // timer vs. an io_work thread handling "Done") and corrupt its
+    // internal state machine. Silero inference on one window is cheap
+    // enough that holding the lock for it is not a real contention
+    // concern.
     std::lock_guard<std::mutex> lock(mutex_);
-    online_vad_samples_scored_ += static_cast<int64_t>(pending.size());
-    if (online_vad_->IsSpeechDetected()) {
-      online_vad_had_speech_ = true;
-      online_vad_last_speech_sample_ = online_vad_samples_scored_;
-    } else if (was_speech) {
-      online_vad_silence_start_sample_ = online_vad_samples_scored_;
-    }
+    if (!online_vad_ || online_vad_pending_samples_.empty()) return;
+    std::vector<float> pending;
+    std::swap(pending, online_vad_pending_samples_);
+    ScoreOnlineVad(pending.data(), static_cast<int32_t>(pending.size()));
   }
 
   int64_t GetOnlineVadFramesCoveredAbsolute() const {

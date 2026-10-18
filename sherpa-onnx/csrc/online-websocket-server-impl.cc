@@ -241,8 +241,14 @@ void OnlineWebsocketDecoder::Decode() {
   lock.lock();
 
   for (auto c : c_vec) {
+    // IsEndpoint() must run before GetResult(): it's what sets the
+    // stream's endpoint_rule/endpoint_delay/speech_end_time fields when
+    // it fires, and GetResult() is what copies them onto the returned
+    // result. Calling GetResult() first (as before online-vad added
+    // those fields) would capture their stale, pre-endpoint values.
+    bool is_endpoint = recognizer_->IsEndpoint(c->s.get());
     auto result = recognizer_->GetResult(c->s.get());
-    if (recognizer_->IsEndpoint(c->s.get())) {
+    if (is_endpoint) {
       result.is_final = true;
       recognizer_->Reset(c->s.get());
     }
