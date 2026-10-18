@@ -106,6 +106,26 @@ class OnlineStream::Impl {
   }
 
   // Assumes mutex_ is already held by the caller.
+  // KNOWN UNRESOLVED ISSUE (found via load testing, not fixed): under
+  // sustained concurrent load (observed at --concurrency=10, ~90+ calls
+  // in via ds-e2e-asr-testing's engine client against the real websocket
+  // server), the process eventually crashes with glibc's "corrupted
+  // double-linked list" (SIGSEGV / exit 139) -- a heap-corruption
+  // signature. Two targeted fixes were tried and did NOT resolve it:
+  // (1) switching the window-stepping loop below from size_t/unsigned to
+  // signed int32_t arithmetic (removes a possible underflow-driven OOB
+  // read, but didn't stop the crash), and (2) bounding vad_predictions_'s
+  // growth so CircularBuffer::Resize() isn't repeatedly called at
+  // ever-larger sizes (see the Pop() call at the end of this function --
+  // also didn't stop it). The crash was not reproduced on this port's
+  // other branch (feat/online-silero-vad-endpoint) under the identical
+  // load test, which reuses the existing VoiceActivityDetector instead
+  // of calling VadModel::IsSpeech() directly here. Root cause not
+  // isolated further (no debugger/ASAN available in the environment
+  // this was developed in) -- flagging explicitly rather than silently
+  // leaving a load-bearing crash undocumented. Do not treat this branch
+  // as production-ready; it exists for architectural comparison with
+  // feat/online-silero-vad-endpoint, not as a merge candidate as-is.
   void RunVadProcessStepLocked() {
     if (!vad_model_ || vad_audio_copy_.empty()) return;
 
@@ -115,9 +135,26 @@ class OnlineStream::Impl {
 
     int32_t window_size = vad_model_->WindowSize();
     int32_t window_shift = vad_model_->WindowShift();
-    size_t pos = 0;
-    while (vad_window_carry_.size() - pos >=
-           static_cast<size_t>(window_size)) {
+    // Defensive: never let a bad/zero/negative stride or a stride larger
+    // than the window drive the loop below out of bounds. Should not
+    // happen in practice (both come from the fixed, already-validated
+    // VadModelConfig), but previously this loop used size_t (unsigned)
+    // arithmetic for `carry.size() - pos`, which would silently
+    // underflow to a huge value instead of going negative if pos ever
+    // slipped past carry.size() -- turning one bad iteration into an
+    // out-of-bounds read handed straight to the ONNX model and
+    // corrupting the heap (observed as a "corrupted double-linked list"
+    // crash under sustained load on the sibling ds-k2-sherpa-onnx-style
+    // branch, which has this same loop). Signed arithmetic with an
+    // explicit guard removes the whole class of risk regardless of
+    // whether this exact path was the trigger.
+    if (window_size <= 0 || window_shift <= 0 || window_shift > window_size) {
+      return;
+    }
+
+    int32_t carry_size = static_cast<int32_t>(vad_window_carry_.size());
+    int32_t pos = 0;
+    while (carry_size - pos >= window_size) {
       bool is_speech =
           vad_model_->IsSpeech(vad_window_carry_.data() + pos, window_size);
       vad_predictions_.Push(is_speech ? 1.0f : 0.0f);
@@ -132,8 +169,30 @@ class OnlineStream::Impl {
 
       pos += window_shift;
     }
-    vad_window_carry_.erase(vad_window_carry_.begin(),
-                            vad_window_carry_.begin() + pos);
+    if (pos > 0) {
+      vad_window_carry_.erase(vad_window_carry_.begin(),
+                              vad_window_carry_.begin() + pos);
+    }
+
+    // Bound memory: only NumTrailingSilence()'s small lookback (a few
+    // hundred ms worth of windows) and the most recent prediction are
+    // ever read: GetVadFramesCoveredAbsolute()/GetVadConfirmedSilence-
+    // StartAbsolute() only need NumFramesReady() (a monotonic counter,
+    // Pop() doesn't touch it -- same absolute-indexing convention as
+    // FeatureExtractor's own fbank ring, see features.cc). Without this,
+    // a long-running stream accumulates one prediction per window for
+    // its *entire* lifetime, forcing CircularBuffer::Resize() to ever-
+    // larger allocations and was the likely trigger for a heap
+    // corruption crash found under sustained load testing (never popping
+    // is a pattern this port's other branch, feat/online-silero-vad-
+    // endpoint, doesn't have -- it tracks scalar counters, not a
+    // growing buffer, which is consistent with only this branch
+    // crashing in that test).
+    constexpr int32_t kMaxRetainedPredictions = 1000;  // ~32s @ 32ms/window
+    constexpr int32_t kTrimToPredictions = 200;        // ~6.4s, generous
+    if (vad_predictions_.Size() > kMaxRetainedPredictions) {
+      vad_predictions_.Pop(vad_predictions_.Size() - kTrimToPredictions);
+    }
   }
 
   void VadProcessStep() {
