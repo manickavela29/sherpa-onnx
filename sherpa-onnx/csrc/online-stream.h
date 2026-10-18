@@ -17,6 +17,7 @@
 #include "sherpa-onnx/csrc/online-paraformer-decoder.h"
 #include "sherpa-onnx/csrc/online-stream-state.h"
 #include "sherpa-onnx/csrc/online-transducer-decoder.h"
+#include "sherpa-onnx/csrc/vad-model-config.h"
 
 namespace sherpa_onnx {
 
@@ -132,6 +133,68 @@ class OnlineStream {
   int32_t GetOptionInt(const std::string &key, int32_t default_value = 0) const;
   float GetOptionFloat(const std::string &key,
                        float default_value = 0.0f) const;
+
+  // ---- Independent VAD pipeline (ds-k2-sherpa-onnx refactor_vad style) ----
+  //
+  // Unlike a design where VAD runs inline inside AcceptWaveform(), here
+  // AcceptWaveform() only appends a *copy* of the incoming waveform to a
+  // separate raw-audio buffer; actual Silero inference only happens when
+  // something calls VadProcessStep() explicitly (the websocket server
+  // does this from its own, faster-cadence timer, running ahead of the
+  // ASR decode loop -- see OnlineRecognizer::VadProcess()). This mirrors
+  // the source architecture's OnlineVadModel/OnlineVadBuffer split: a
+  // prediction buffer the ASR side polls for coverage, written by a VAD
+  // step the ASR side never calls itself.
+
+  // Creates the independent VAD pipeline for this stream from
+  // `vad_config` (`vad_config.silero_vad.model` must be non-empty).
+  // `asr_frame_shift_ms` is the ASR feature pipeline's frame shift, used
+  // to convert VAD-buffer frame counts into ASR-frame-equivalent units
+  // for the coverage gate and batch-skip.
+  void InitVad(const VadModelConfig &vad_config, float asr_frame_shift_ms);
+
+  // True if InitVad() was called on this stream.
+  bool HasVad() const;
+
+  // Runs one VAD processing step: drains whatever raw audio has been
+  // copied since the last call, runs Silero inference window-by-window,
+  // and pushes one prediction per window into this stream's
+  // OnlineVadBuffer. Called by OnlineRecognizer::VadProcess(), never
+  // from AcceptWaveform() itself.
+  void VadProcessStep();
+
+  // Total ASR-feature-frame-equivalent audio the VAD buffer has actually
+  // scored so far, in the same absolute frame space as
+  // GetNumFramesSinceStart() + GetNumProcessedFrames() (never reset by
+  // Reset()/ResetVad()). 0 if no VAD is configured.
+  int64_t GetVadFramesCoveredAbsolute() const;
+
+  // True + the absolute frame (same space as above) where the VAD
+  // buffer's current confirmed-silence run began, if the VAD is
+  // presently silent and a silence run has actually started.
+  bool GetVadConfirmedSilenceStartAbsolute(int64_t *out_frame) const;
+
+  // True if the VAD buffer currently considers this stream to contain
+  // speech (sticky through its own min-silence-duration hangover).
+  bool IsVadSpeechDetected() const;
+
+  // True once this stream has seen speech and the VAD buffer has since
+  // observed enough trailing silence (min_silence_duration) to end it.
+  bool IsVadEndpoint() const;
+
+  // Clears the "seen speech this segment" bookkeeping. Does not drop the
+  // VAD buffer's own continuous state.
+  void ResetVad();
+
+  // True once InputFinished() has been called on this stream.
+  bool IsInputFinished() const;
+
+  // Which endpoint rule last fired for this stream's current segment: 0
+  // none, 1 blank-based (rule1/2/3, undistinguished), 4 VAD-based. Reset
+  // to 0 by OnlineRecognizer::Reset().
+  int32_t &GetEndpointRule();
+  float &GetEndpointDelay();
+  float &GetSpeechEndTime();
 
  private:
   class Impl;
