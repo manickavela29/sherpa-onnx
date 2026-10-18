@@ -265,8 +265,29 @@ void OnlineWebsocketDecoder::ProcessVadConnections(const asio::error_code &ec) {
     SHERPA_ONNX_LOG(FATAL) << "The VAD loop is aborted!";
   }
 
+  // `connections_` is protected by `mutex_` (see its declaration above),
+  // not `vad_mutex_`. Iterating it here under vad_mutex_ alone raced with
+  // ProcessConnections()'s `connections_.erase(hdl)` under mutex_ on
+  // another thread -- confirmed via AddressSanitizer as a heap-use-after-
+  // free (a Connection destroyed by the ASR decode-loop thread while this
+  // VAD-loop thread was still mid-iteration/copying its shared_ptr out of
+  // the same std::map). This was the actual root cause of the crash found
+  // under load -- not a memory leak, not memory pressure: a lock taken
+  // on the wrong mutex for the data it was protecting. Snapshot under the
+  // correct lock first, then do the vad_ready_connections_/vad_active_
+  // bookkeeping under vad_mutex_ as before.
+  std::vector<std::pair<connection_hdl, std::shared_ptr<Connection>>>
+      snapshot;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    snapshot.reserve(connections_.size());
+    for (auto &p : connections_) {
+      snapshot.emplace_back(p.first, p.second);
+    }
+  }
+
   std::lock_guard<std::mutex> lock(vad_mutex_);
-  for (auto &p : connections_) {
+  for (auto &p : snapshot) {
     auto hdl = p.first;
     auto c = p.second;
 
