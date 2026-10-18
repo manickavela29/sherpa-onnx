@@ -308,9 +308,23 @@ void OnlineRecognizer::MaybeSkipVadSilence(OnlineStream *s) const {
   // confirmed-silence range (and the VAD has actually scored that far),
   // fast-forward over it so the encoder is never run on it.
   while (true) {
+    int32_t local_processed = s->GetNumProcessedFrames();
+    // Safety clamp: never advance past what the feature extractor has
+    // actually buffered. The VAD's own coverage estimate (vad_covered)
+    // is derived from a raw-sample counter and is necessarily
+    // approximate relative to the real fbank frame count -- trusting it
+    // alone to gate how far num_processed_frames_ moves risks running
+    // DecodeStreams/GetFrames past real data and crashing (found via
+    // load testing the sibling ds-k2-sherpa-onnx-style implementation,
+    // which has the same unguarded pattern: a long-running load test
+    // eventually hit features.cc:GetFrames tripping its
+    // "frame_index + n <= NumFramesReady()" assertion).
+    if (local_processed + chunk_shift > s->NumFramesReady()) {
+      break;
+    }
+
     int64_t window_start =
-        static_cast<int64_t>(s->GetNumFramesSinceStart()) +
-        s->GetNumProcessedFrames();
+        static_cast<int64_t>(s->GetNumFramesSinceStart()) + local_processed;
     int64_t window_end = window_start + chunk_size;
     if (window_start < silence_start || window_end > vad_covered) {
       break;
