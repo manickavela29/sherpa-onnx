@@ -32,6 +32,10 @@ void OnlineWebsocketDecoderConfig::Register(ParseOptions *po) {
                "The sample rate of the input audio from the client. "
                "If it differs from the model's expected sample rate, "
                "the server will resample internally.");
+
+  po->Register("vad-loop-interval-ms", &vad_loop_interval_ms,
+               "How often the independent VAD tick runs. Only meaningful "
+               "when --online-vad-model is set.");
 }
 
 void OnlineWebsocketDecoderConfig::Validate() const {
@@ -40,6 +44,7 @@ void OnlineWebsocketDecoderConfig::Validate() const {
   SHERPA_ONNX_CHECK_GT(max_batch_size, 0);
   SHERPA_ONNX_CHECK_GT(end_tail_padding, 0);
   SHERPA_ONNX_CHECK_GT(input_sample_rate, 0);
+  SHERPA_ONNX_CHECK_GT(vad_loop_interval_ms, 0);
 }
 
 void OnlineWebsocketServerConfig::Register(sherpa_onnx::ParseOptions *po) {
@@ -57,7 +62,15 @@ void OnlineWebsocketServerConfig::Validate() const {
 OnlineWebsocketDecoder::OnlineWebsocketDecoder(OnlineWebsocketServer *server)
     : server_(server),
       config_(server->GetConfig().decoder_config),
-      timer_(server->GetWorkContext()) {
+      timer_(server->GetWorkContext()),
+      vad_timer_(server->GetVadContext()) {
+  // The websocket server drives the independent VAD tick itself (see
+  // ProcessVadConnections), so it's the one caller that opts its
+  // recognizer into deferred VAD inference. Every other binary built on
+  // OnlineRecognizerConfig keeps the default (inline) behavior.
+  if (config_.recognizer_config.online_vad_config.IsEnabled()) {
+    config_.recognizer_config.online_vad_config.defer_inference = true;
+  }
   recognizer_ = std::make_unique<OnlineRecognizer>(config_.recognizer_config);
 }
 
@@ -118,6 +131,19 @@ void OnlineWebsocketDecoder::Run() {
       [this](const asio::error_code &ec) { ProcessConnections(ec); });
 }
 
+void OnlineWebsocketDecoder::RunVad() {
+  if (!config_.recognizer_config.online_vad_config.IsEnabled()) {
+    // No online VAD configured; never arm vad_timer_ at all.
+    return;
+  }
+
+  vad_timer_.expires_after(
+      std::chrono::milliseconds(config_.vad_loop_interval_ms));
+
+  vad_timer_.async_wait(
+      [this](const asio::error_code &ec) { ProcessVadConnections(ec); });
+}
+
 void OnlineWebsocketDecoder::ProcessConnections(const asio::error_code &ec) {
   if (ec) {
     SHERPA_ONNX_LOG(FATAL) << "The decoder loop is aborted!";
@@ -141,12 +167,14 @@ void OnlineWebsocketDecoder::ProcessConnections(const asio::error_code &ec) {
       continue;
     }
 
-    if (!recognizer_->IsReady(c->s.get()) && !c->eof) {
+    bool ready = recognizer_->IsReady(c->s.get());
+
+    if (!ready && !c->eof) {
       // this stream has not enough frames to decode, so skip it
       continue;
     }
 
-    if (!recognizer_->IsReady(c->s.get()) && c->eof) {
+    if (!ready && c->eof) {
       // We won't receive samples from the client, so send a Done! to client
 
       asio::post(server_->GetWorkContext(),
@@ -213,8 +241,14 @@ void OnlineWebsocketDecoder::Decode() {
   lock.lock();
 
   for (auto c : c_vec) {
+    // IsEndpoint() must run before GetResult(): it's what sets the
+    // stream's endpoint_rule/endpoint_delay/speech_end_time fields when
+    // it fires, and GetResult() is what copies them onto the returned
+    // result. Calling GetResult() first (as before online-vad added
+    // those fields) would capture their stale, pre-endpoint values.
+    bool is_endpoint = recognizer_->IsEndpoint(c->s.get());
     auto result = recognizer_->GetResult(c->s.get());
-    if (recognizer_->IsEndpoint(c->s.get())) {
+    if (is_endpoint) {
       result.is_final = true;
       recognizer_->Reset(c->s.get());
     }
@@ -232,12 +266,59 @@ void OnlineWebsocketDecoder::Decode() {
   }
 }
 
+void OnlineWebsocketDecoder::ProcessVadConnections(const asio::error_code &ec) {
+  if (ec) {
+    SHERPA_ONNX_LOG(FATAL) << "The VAD loop is aborted!";
+  }
+
+  std::vector<std::shared_ptr<Connection>> snapshot;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    snapshot.reserve(connections_.size());
+    for (auto &p : connections_) {
+      // Skip connections currently being decoded: RunOnlineVad() and the
+      // ASR decode path both mutate OnlineStream state (e.g.
+      // num_processed_frames_) without their own fine-grained locking,
+      // so running both at once for the same stream would race. Streams
+      // skipped here are picked up on the next VAD tick instead.
+      if (active_.count(p.first)) {
+        continue;
+      }
+      snapshot.push_back(p.second);
+    }
+  }
+
+  for (auto &c : snapshot) {
+    if (c->eof) {
+      continue;
+    }
+
+    c->s->RunOnlineVad();
+
+    if (!c->s->IsOnlineVadSpeechDetected()) {
+      OnlineRecognizerResult empty;
+      asio::post(server_->GetConnectionContext(),
+                 [this, hdl = c->hdl, str = empty.AsJsonString()]() {
+                   server_->Send(hdl, str);
+                 });
+    }
+  }
+
+  // Schedule another call
+  vad_timer_.expires_after(
+      std::chrono::milliseconds(config_.vad_loop_interval_ms));
+
+  vad_timer_.async_wait(
+      [this](const asio::error_code &ec) { ProcessVadConnections(ec); });
+}
+
 OnlineWebsocketServer::OnlineWebsocketServer(
     asio::io_context &io_conn, asio::io_context &io_work,
-    const OnlineWebsocketServerConfig &config)
+    asio::io_context &io_vad, const OnlineWebsocketServerConfig &config)
     : config_(config),
       io_conn_(io_conn),
       io_work_(io_work),
+      io_vad_(io_vad),
       log_(OpenOutputFile(config.log_file, std::ios::app)),
       tee_(std::cout, log_),
       decoder_(this) {
@@ -278,6 +359,7 @@ void OnlineWebsocketServer::Run(uint16_t port) {
     SHERPA_ONNX_EXIT(0);
   }
   decoder_.Run();
+  decoder_.RunVad();
 }
 
 void OnlineWebsocketServer::SetupLog() {
