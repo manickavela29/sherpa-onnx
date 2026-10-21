@@ -32,6 +32,13 @@ void OnlineWebsocketDecoderConfig::Register(ParseOptions *po) {
                "The sample rate of the input audio from the client. "
                "If it differs from the model's expected sample rate, "
                "the server will resample internally.");
+
+  po->Register("vad-loop-interval-ms", &vad_loop_interval_ms,
+               "How often the independent VAD tick (VadProcess) runs. "
+               "Only meaningful when --online-vad-model is set.");
+
+  po->Register("max-vad-batch-size", &max_vad_batch_size,
+               "Max batch size for one VadProcess() call.");
 }
 
 void OnlineWebsocketDecoderConfig::Validate() const {
@@ -40,6 +47,8 @@ void OnlineWebsocketDecoderConfig::Validate() const {
   SHERPA_ONNX_CHECK_GT(max_batch_size, 0);
   SHERPA_ONNX_CHECK_GT(end_tail_padding, 0);
   SHERPA_ONNX_CHECK_GT(input_sample_rate, 0);
+  SHERPA_ONNX_CHECK_GT(vad_loop_interval_ms, 0);
+  SHERPA_ONNX_CHECK_GT(max_vad_batch_size, 0);
 }
 
 void OnlineWebsocketServerConfig::Register(sherpa_onnx::ParseOptions *po) {
@@ -57,7 +66,8 @@ void OnlineWebsocketServerConfig::Validate() const {
 OnlineWebsocketDecoder::OnlineWebsocketDecoder(OnlineWebsocketServer *server)
     : server_(server),
       config_(server->GetConfig().decoder_config),
-      timer_(server->GetWorkContext()) {
+      timer_(server->GetWorkContext()),
+      vad_timer_(server->GetVadContext()) {
   recognizer_ = std::make_unique<OnlineRecognizer>(config_.recognizer_config);
 }
 
@@ -116,6 +126,19 @@ void OnlineWebsocketDecoder::Run() {
 
   timer_.async_wait(
       [this](const asio::error_code &ec) { ProcessConnections(ec); });
+}
+
+void OnlineWebsocketDecoder::RunVad() {
+  if (!config_.recognizer_config.online_vad_config.IsEnabled()) {
+    // No online VAD configured; never arm vad_timer_ at all.
+    return;
+  }
+
+  vad_timer_.expires_after(
+      std::chrono::milliseconds(config_.vad_loop_interval_ms));
+
+  vad_timer_.async_wait(
+      [this](const asio::error_code &ec) { ProcessVadConnections(ec); });
 }
 
 void OnlineWebsocketDecoder::ProcessConnections(const asio::error_code &ec) {
@@ -213,8 +236,13 @@ void OnlineWebsocketDecoder::Decode() {
   lock.lock();
 
   for (auto c : c_vec) {
+    // IsEndpoint() must run before GetResult(): it's what sets the
+    // stream's endpoint_rule/endpoint_delay/speech_end_time fields when
+    // it fires, and GetResult() is what copies them onto the returned
+    // result.
+    bool is_endpoint = recognizer_->IsEndpoint(c->s.get());
     auto result = recognizer_->GetResult(c->s.get());
-    if (recognizer_->IsEndpoint(c->s.get())) {
+    if (is_endpoint) {
       result.is_final = true;
       recognizer_->Reset(c->s.get());
     }
@@ -232,12 +260,96 @@ void OnlineWebsocketDecoder::Decode() {
   }
 }
 
+void OnlineWebsocketDecoder::ProcessVadConnections(const asio::error_code &ec) {
+  if (ec) {
+    SHERPA_ONNX_LOG(FATAL) << "The VAD loop is aborted!";
+  }
+
+  // `connections_` is protected by `mutex_` (see its declaration above),
+  // not `vad_mutex_`. Iterating it here under vad_mutex_ alone raced with
+  // ProcessConnections()'s `connections_.erase(hdl)` under mutex_ on
+  // another thread -- confirmed via AddressSanitizer as a heap-use-after-
+  // free (a Connection destroyed by the ASR decode-loop thread while this
+  // VAD-loop thread was still mid-iteration/copying its shared_ptr out of
+  // the same std::map). This was the actual root cause of the crash found
+  // under load -- not a memory leak, not memory pressure: a lock taken
+  // on the wrong mutex for the data it was protecting. Snapshot under the
+  // correct lock first, then do the vad_ready_connections_/vad_active_
+  // bookkeeping under vad_mutex_ as before.
+  std::vector<std::pair<connection_hdl, std::shared_ptr<Connection>>>
+      snapshot;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    snapshot.reserve(connections_.size());
+    for (auto &p : connections_) {
+      snapshot.emplace_back(p.first, p.second);
+    }
+  }
+
+  std::lock_guard<std::mutex> lock(vad_mutex_);
+  for (auto &p : snapshot) {
+    auto hdl = p.first;
+    auto c = p.second;
+
+    if (!server_->Contains(hdl)) continue;
+    if (vad_active_.count(hdl)) continue;
+    if (c->eof) continue;
+
+    vad_ready_connections_.push_back(c);
+    // In VadDecode(), it will remove hdl from vad_active_.
+    vad_active_.insert(hdl);
+  }
+
+  if (!vad_ready_connections_.empty()) {
+    asio::post(server_->GetVadContext(), [this]() { VadDecode(); });
+  }
+
+  // Schedule another call
+  vad_timer_.expires_after(
+      std::chrono::milliseconds(config_.vad_loop_interval_ms));
+
+  vad_timer_.async_wait(
+      [this](const asio::error_code &ec) { ProcessVadConnections(ec); });
+}
+
+void OnlineWebsocketDecoder::VadDecode() {
+  std::unique_lock<std::mutex> lock(vad_mutex_);
+  if (vad_ready_connections_.empty()) return;
+
+  std::vector<std::shared_ptr<Connection>> c_vec;
+  std::vector<OnlineStream *> s_vec;
+  while (!vad_ready_connections_.empty() &&
+         static_cast<int32_t>(s_vec.size()) < config_.max_vad_batch_size) {
+    auto c = vad_ready_connections_.front();
+    vad_ready_connections_.pop_front();
+    c_vec.push_back(c);
+    s_vec.push_back(c->s.get());
+  }
+
+  if (!vad_ready_connections_.empty()) {
+    asio::post(server_->GetVadContext(), [this]() { VadDecode(); });
+  }
+
+  lock.unlock();
+  // The actual VadProcess call: parallel to, and scheduled independently
+  // of, DecodeStreams(). Operates purely on each stream's copied-audio
+  // buffer and its own OnlineVadBuffer -- never touches num_processed_frames_
+  // or any other ASR decode state directly.
+  recognizer_->VadProcess(s_vec.data(), s_vec.size());
+  lock.lock();
+
+  for (auto &c : c_vec) {
+    vad_active_.erase(c->hdl);
+  }
+}
+
 OnlineWebsocketServer::OnlineWebsocketServer(
     asio::io_context &io_conn, asio::io_context &io_work,
-    const OnlineWebsocketServerConfig &config)
+    asio::io_context &io_vad, const OnlineWebsocketServerConfig &config)
     : config_(config),
       io_conn_(io_conn),
       io_work_(io_work),
+      io_vad_(io_vad),
       log_(OpenOutputFile(config.log_file, std::ios::app)),
       tee_(std::cout, log_),
       decoder_(this) {
@@ -278,6 +390,7 @@ void OnlineWebsocketServer::Run(uint16_t port) {
     SHERPA_ONNX_EXIT(0);
   }
   decoder_.Run();
+  decoder_.RunVad();
 }
 
 void OnlineWebsocketServer::SetupLog() {

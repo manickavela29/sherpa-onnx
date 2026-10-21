@@ -77,6 +77,11 @@ std::string OnlineRecognizerResult::AsJsonString() const {
   os << "\"segment\": " << segment << ", ";
   os << "\"words\": " << VecToString(words, 0) << ", ";
   os << "\"num_trailing_blanks\": " << num_trailing_blanks << ", ";
+  os << "\"endpoint_rule\": " << endpoint_rule << ", ";
+  os << "\"endpoint_delay\": " << std::fixed << std::setprecision(2)
+     << endpoint_delay << ", ";
+  os << "\"speech_end_time\": " << std::fixed << std::setprecision(2)
+     << speech_end_time << ", ";
   os << "\"start_time\": " << std::fixed << std::setprecision(2) << start_time
      << ", ";
   os << "\"is_final\": " << (is_final ? "true" : "false") << ", ";
@@ -91,6 +96,7 @@ void OnlineRecognizerConfig::Register(ParseOptions *po) {
   endpoint_config.Register(po);
   lm_config.Register(po);
   ctc_fst_decoder_config.Register(po);
+  online_vad_config.Register(po);
   hr.Register(po);
 
   po->Register("enable-endpoint", &enable_endpoint,
@@ -192,6 +198,11 @@ bool OnlineRecognizerConfig::Validate() const {
     return false;
   }
 
+  if (online_vad_config.IsEnabled() && !online_vad_config.Validate()) {
+    SHERPA_ONNX_LOGE("Errors in online_vad_config");
+    return false;
+  }
+
   return model_config.Validate();
 }
 
@@ -204,6 +215,7 @@ std::string OnlineRecognizerConfig::ToString() const {
   os << "lm_config=" << lm_config.ToString() << ", ";
   os << "endpoint_config=" << endpoint_config.ToString() << ", ";
   os << "ctc_fst_decoder_config=" << ctc_fst_decoder_config.ToString() << ", ";
+  os << "online_vad_config=" << online_vad_config.ToString() << ", ";
   os << "enable_endpoint=" << (enable_endpoint ? "True" : "False") << ", ";
   os << "max_active_paths=" << max_active_paths << ", ";
   os << "hotwords_score=" << hotwords_score << ", ";
@@ -220,26 +232,121 @@ std::string OnlineRecognizerConfig::ToString() const {
 }
 
 OnlineRecognizer::OnlineRecognizer(const OnlineRecognizerConfig &config)
-    : impl_(OnlineRecognizerImpl::Create(config)) {}
+    : impl_(OnlineRecognizerImpl::Create(config)),
+      online_vad_config_(config.online_vad_config),
+      asr_frame_shift_ms_(config.feat_config.frame_shift_ms) {}
 
 template <typename Manager>
 OnlineRecognizer::OnlineRecognizer(Manager *mgr,
                                    const OnlineRecognizerConfig &config)
-    : impl_(OnlineRecognizerImpl::Create(mgr, config)) {}
+    : impl_(OnlineRecognizerImpl::Create(mgr, config)),
+      online_vad_config_(config.online_vad_config),
+      asr_frame_shift_ms_(config.feat_config.frame_shift_ms) {}
 
 OnlineRecognizer::~OnlineRecognizer() = default;
 
 std::unique_ptr<OnlineStream> OnlineRecognizer::CreateStream() const {
-  return impl_->CreateStream();
+  auto s = impl_->CreateStream();
+  if (online_vad_config_.IsEnabled()) {
+    s->InitVad(online_vad_config_.ToVadModelConfig(), asr_frame_shift_ms_);
+  }
+  return s;
 }
 
 std::unique_ptr<OnlineStream> OnlineRecognizer::CreateStream(
     const std::string &hotwords) const {
-  return impl_->CreateStream(hotwords);
+  auto s = impl_->CreateStream(hotwords);
+  if (online_vad_config_.IsEnabled()) {
+    s->InitVad(online_vad_config_.ToVadModelConfig(), asr_frame_shift_ms_);
+  }
+  return s;
+}
+
+void OnlineRecognizer::VadProcess(OnlineStream **ss, int32_t n) const {
+  for (int32_t i = 0; i != n; ++i) {
+    if (ss[i]->HasVad()) {
+      ss[i]->VadProcessStep();
+    }
+  }
 }
 
 bool OnlineRecognizer::IsReady(OnlineStream *s) const {
-  return impl_->IsReady(s);
+  bool ready = impl_->IsReady(s);
+  if (!ready || !s->HasVad() || s->IsInputFinished()) {
+    return ready;
+  }
+
+  MaybeSkipVadSilence(s);
+
+  // MaybeSkipVadSilence() may have just advanced num_processed_frames_,
+  // but `ready` above was computed *before* that, against the old
+  // position. Re-validate against real fbank-frame availability at the
+  // new position before trusting it: the VAD coverage check below is an
+  // *additional* requirement on top of real readiness, never a
+  // substitute for it. Skipping this re-check was the actual root cause
+  // of a crash found under sustained load (features.cc:GetFrames
+  // tripping "frame_index + n <= NumFramesReady()", confirmed via an
+  // AddressSanitizer-instrumented build) -- the per-step clamp inside
+  // MaybeSkipVadSilence only protects each chunk_shift-sized step of the
+  // skip loop itself, not the chunk_size-sized window this function
+  // then promises the caller is safe to decode.
+  ready = impl_->IsReady(s);
+  if (!ready) {
+    return false;
+  }
+
+  int32_t chunk_size = impl_->GetChunkSizeForVad();
+  if (chunk_size <= 0) {
+    // This decoder impl doesn't support VAD-coverage gating (e.g.
+    // Paraformer) -- fall back to the blank-frame-count readiness check
+    // only.
+    return ready;
+  }
+
+  int64_t target = static_cast<int64_t>(s->GetNumFramesSinceStart()) +
+                   s->GetNumProcessedFrames() + chunk_size;
+  return s->GetVadFramesCoveredAbsolute() >= target;
+}
+
+void OnlineRecognizer::MaybeSkipVadSilence(OnlineStream *s) const {
+  if (!s->HasVad() || s->IsInputFinished() || !online_vad_config_.batch_skip) {
+    return;
+  }
+
+  int32_t chunk_size = impl_->GetChunkSizeForVad();
+  int32_t chunk_shift = impl_->GetChunkShiftForVad();
+  if (chunk_size <= 0 || chunk_shift <= 0) {
+    return;
+  }
+
+  int64_t silence_start = 0;
+  if (!s->GetVadConfirmedSilenceStartAbsolute(&silence_start)) {
+    return;
+  }
+  int64_t vad_covered = s->GetVadFramesCoveredAbsolute();
+
+  while (true) {
+    int32_t local_processed = s->GetNumProcessedFrames();
+    // Safety clamp: never advance past what the feature extractor has
+    // actually buffered. The VAD's own coverage estimate
+    // (vad_covered, derived from window-count * window-shift-seconds)
+    // is necessarily approximate -- trusting it alone to gate how far
+    // num_processed_frames_ moves risks running DecodeStreams/GetFrames
+    // past real data and crashing (found via load testing: a long-
+    // running load test eventually hit `features.cc:GetFrames` tripping
+    // its "frame_index + n <= NumFramesReady()" assertion).
+    if (local_processed + chunk_shift > s->NumFramesReady()) {
+      break;
+    }
+
+    int64_t window_start =
+        static_cast<int64_t>(s->GetNumFramesSinceStart()) + local_processed;
+    int64_t window_end = window_start + chunk_size;
+    if (window_start < silence_start || window_end > vad_covered) {
+      break;
+    }
+    s->GetNumProcessedFrames() += chunk_shift;
+  }
 }
 
 void OnlineRecognizer::WarmpUpRecognizer(int32_t warmup, int32_t mbs) const {
@@ -256,14 +363,42 @@ OnlineRecognizerResult OnlineRecognizer::GetResult(OnlineStream *s) const {
   auto r = impl_->GetResult(s);
   r.text = RemoveLeadingSpaces(r.text);
   r.text = RemoveLeadingPunct(r.text);
+  r.endpoint_rule = s->GetEndpointRule();
+  r.endpoint_delay = s->GetEndpointDelay();
+  r.speech_end_time = s->GetSpeechEndTime();
   return r;
 }
 
 bool OnlineRecognizer::IsEndpoint(OnlineStream *s) const {
-  return impl_->IsEndpoint(s);
+  if (s->HasVad() && s->IsVadEndpoint()) {
+    s->GetEndpointRule() = 4;
+
+    int64_t covered = s->GetVadFramesCoveredAbsolute();
+    int64_t last_speech = 0;
+    bool had_speech = s->GetVadConfirmedSilenceStartAbsolute(&last_speech);
+    float frame_shift_s = asr_frame_shift_ms_ / 1000.0f;
+    if (had_speech) {
+      s->GetSpeechEndTime() = last_speech * frame_shift_s;
+      s->GetEndpointDelay() = (covered - last_speech) * frame_shift_s;
+    }
+    return true;
+  }
+  if (impl_->IsEndpoint(s)) {
+    s->GetEndpointRule() = 1;
+    return true;
+  }
+  return false;
 }
 
-void OnlineRecognizer::Reset(OnlineStream *s) const { impl_->Reset(s); }
+void OnlineRecognizer::Reset(OnlineStream *s) const {
+  impl_->Reset(s);
+  if (s->HasVad()) {
+    s->ResetVad();
+  }
+  s->GetEndpointRule() = 0;
+  s->GetEndpointDelay() = 0;
+  s->GetSpeechEndTime() = 0;
+}
 
 #if __ANDROID_API__ >= 9
 template OnlineRecognizer::OnlineRecognizer(
