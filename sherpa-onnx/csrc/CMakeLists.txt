@@ -290,9 +290,7 @@ if(SHERPA_ONNX_ENABLE_TTS)
   list(APPEND sources
     character-lexicon.cc
     hifigan-vocoder.cc
-    kokoro-multi-lang-lexicon.cc
     lexicon.cc
-    matcha-tts-lexicon.cc
     melo-tts-lexicon.cc
     offline-tts-character-frontend.cc
     offline-tts-frontend.cc
@@ -315,8 +313,8 @@ if(SHERPA_ONNX_ENABLE_TTS)
     offline-tts-zipvoice-model-config.cc
     offline-tts-zipvoice-model.cc
     offline-tts.cc
-    piper-phonemize-lexicon.cc
     sentence-piece-tokenizer.cc
+    tts-text-normalizer.cc
     vocoder.cc
     vocos-vocoder.cc
   )
@@ -477,11 +475,6 @@ if(NOT BUILD_SHARED_LIBS AND APPLE)
 endif()
 
 target_link_libraries(sherpa-onnx-core fstfar fst)
-
-if(SHERPA_ONNX_ENABLE_TTS)
-  target_link_libraries(sherpa-onnx-core
-    piper_phonemize)
-endif()
 
 if(SHERPA_ONNX_ENABLE_CHECK)
   target_compile_definitions(sherpa-onnx-core PUBLIC SHERPA_ONNX_ENABLE_CHECK=1)
@@ -834,6 +827,7 @@ if(SHERPA_ONNX_ENABLE_TESTS)
     math-test.cc
     offline-recognizer-canary-impl-test.cc
     offline-recognizer-cohere-transcribe-impl-test.cc
+    offline-recognizer-ctc-impl-test.cc
     offline-recognizer-funasr-nano-impl-test.cc
     offline-recognizer-moonshine-v2-impl-test.cc
     offline-recognizer-qwen3-asr-impl-test.cc
@@ -841,6 +835,7 @@ if(SHERPA_ONNX_ENABLE_TESTS)
     offline-whisper-timestamp-rules-test.cc
     packed-sequence-test.cc
     pad-sequence-test.cc
+    recognizer-result-json-test.cc
     regex-lang-test.cc
     session-test.cc
     slice-test.cc
@@ -855,7 +850,6 @@ if(SHERPA_ONNX_ENABLE_TESTS)
   if(SHERPA_ONNX_ENABLE_TTS)
     list(APPEND sherpa_onnx_test_srcs
       sentence-piece-tokenizer-test.cc
-      piper-phonemize-test.cc
       offline-tts-supertonic-unicode-processor-test.cc
     )
   endif()
