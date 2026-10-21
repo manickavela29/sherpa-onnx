@@ -57,6 +57,12 @@ void OnlineVadModelConfig::Register(ParseOptions *po) {
   po->Register("online-vad-debug", &debug,
                "true to display debug information when loading the online "
                "VAD model");
+
+  po->Register("online-vad-batch-skip", &batch_skip,
+               "true (default) to skip ASR decoding entirely on chunks the "
+               "online VAD has already confirmed are silence. false to let "
+               "the VAD drive endpointing as usual but still decode every "
+               "chunk.");
 }
 
 bool OnlineVadModelConfig::Validate() const {
@@ -120,7 +126,8 @@ std::string OnlineVadModelConfig::ToString() const {
   os << "sample_rate=" << sample_rate << ", ";
   os << "num_threads=" << num_threads << ", ";
   os << "provider=\"" << provider << "\", ";
-  os << "debug=" << (debug ? "True" : "False") << ")";
+  os << "debug=" << (debug ? "True" : "False") << ", ";
+  os << "batch_skip=" << (batch_skip ? "True" : "False") << ")";
   return os.str();
 }
 

@@ -31,6 +31,9 @@ ONLINE_VAD_MIN_SILENCE_DURATION=${ONLINE_VAD_MIN_SILENCE_DURATION:-0.5}
 ONLINE_VAD_MIN_SPEECH_DURATION=${ONLINE_VAD_MIN_SPEECH_DURATION:-0.25}
 ONLINE_VAD_WINDOW_SIZE=${ONLINE_VAD_WINDOW_SIZE:-512}
 ONLINE_VAD_SAMPLE_RATE=${ONLINE_VAD_SAMPLE_RATE:-16000}
+# true (default) = skip ASR decoding on chunks the VAD confirms are silence.
+# false = VAD still drives endpointing but every chunk is decoded anyway.
+ONLINE_VAD_BATCH_SKIP=${ONLINE_VAD_BATCH_SKIP:-true}
 
 for f in tokens.txt encoder.onnx decoder.onnx joiner.onnx; do
   if [ ! -f "$MODEL_DIR/$f" ]; then
@@ -53,6 +56,7 @@ if [ -n "$ONLINE_VAD_MODEL" ]; then
     "--online-vad-min-speech-duration=$ONLINE_VAD_MIN_SPEECH_DURATION"
     "--online-vad-window-size=$ONLINE_VAD_WINDOW_SIZE"
     "--online-vad-sample-rate=$ONLINE_VAD_SAMPLE_RATE"
+    "--online-vad-batch-skip=$ONLINE_VAD_BATCH_SKIP"
     "--vad-loop-interval-ms=$VAD_LOOP_INTERVAL_MS"
     "--num-vad-threads=$NUM_VAD_THREADS"
   )

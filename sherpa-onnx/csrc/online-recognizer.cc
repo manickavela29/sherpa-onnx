@@ -309,7 +309,7 @@ bool OnlineRecognizer::IsReady(OnlineStream *s) const {
 }
 
 void OnlineRecognizer::MaybeSkipVadSilence(OnlineStream *s) const {
-  if (!s->HasVad() || s->IsInputFinished()) {
+  if (!s->HasVad() || s->IsInputFinished() || !online_vad_config_.batch_skip) {
     return;
   }
 

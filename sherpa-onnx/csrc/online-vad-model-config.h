@@ -63,6 +63,13 @@ struct OnlineVadModelConfig {
 
   bool debug = false;
 
+  // If true, OnlineRecognizer::IsReady() fast-forwards num_processed_frames_
+  // over any ASR chunk window the VAD has already confirmed is silence,
+  // skipping ASR decode on it entirely (MaybeSkipVadSilence()). If false,
+  // the VAD still drives endpointing as usual, but every chunk is decoded
+  // regardless of what the VAD predicted. Default on.
+  bool batch_skip = true;
+
   OnlineVadModelConfig() = default;
 
   void Register(ParseOptions *po);
