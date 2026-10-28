@@ -67,6 +67,12 @@ class Endpoint {
   bool IsEndpoint(int32_t num_frames_decoded, int32_t trailing_silence_frames,
                   float frame_shift_in_seconds) const;
 
+  /// Same as IsEndpoint() but returns which rule fired: 1 for rule1, 2 for
+  /// rule2, 3 for rule3 (the first activated one in this order, which is also
+  /// the one that makes IsEndpoint() return true), and 0 if no rule fired.
+  int32_t FiredRule(int32_t num_frames_decoded, int32_t trailing_silence_frames,
+                    float frame_shift_in_seconds) const;
+
  private:
   EndpointConfig config_;
 };

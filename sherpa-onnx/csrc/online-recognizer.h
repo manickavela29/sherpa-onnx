@@ -70,6 +70,24 @@ struct OnlineRecognizerResult {
   /// initialization of this struct keeps working.
   int32_t num_trailing_blanks = 0;
 
+  /// Endpoint diagnostics. Used only in ./online-websocket-server-impl.cc and
+  /// only if OnlineRecognizerConfig::endpoint_diagnostics is true. They are
+  /// appended to the json string (see AsJsonString()) only if
+  /// endpoint_diagnostics is true here, so the default output is unchanged.
+  bool endpoint_diagnostics = false;
+
+  /// 0: this result is not an endpoint, 1/2/3: rule1/rule2/rule3 fired
+  int32_t endpoint_rule_id = 0;
+
+  /// Audio time in seconds, on the stream's clock (the same clock as
+  /// start_time), at which the endpoint was decided. 0 if not an endpoint.
+  float endpoint_time = 0;
+
+  /// An ESTIMATE of where speech ended: endpoint_time minus the trailing
+  /// silence (num_trailing_blanks x subsampling x frame shift) that the
+  /// decoder had seen. 0 if not an endpoint.
+  float speech_end_time = 0;
+
   /** Return a json string.
    *
    * The returned string contains:
@@ -99,6 +117,10 @@ struct OnlineRecognizerConfig {
   OnlineCtcFstDecoderConfig ctc_fst_decoder_config;
 
   bool enable_endpoint = true;
+
+  // If true, the websocket server adds endpoint_rule, endpoint_rule_id,
+  // endpoint_time and speech_end_time to each json result. Off by default.
+  bool endpoint_diagnostics = false;
 
   std::string decoding_method = "greedy_search";
   // now support modified_beam_search and greedy_search
@@ -228,6 +250,17 @@ class OnlineRecognizer {
   // Note: If this function returns true, you usually want to
   // invoke Reset(s).
   bool IsEndpoint(OnlineStream *s) const;
+
+  // Which rule made IsEndpoint(s) true and when. Call it before Reset(s),
+  // which restarts the segment counters it reads. rule_id is 0 (and the
+  // times are 0) if s is not at an endpoint, endpoints are disabled, or the
+  // model type does not support it (currently only transducer models do).
+  struct EndpointInfo {
+    int32_t rule_id = 0;           // 0 none, 1/2/3: rule1/rule2/rule3
+    float endpoint_time = 0;       // seconds on the stream's clock
+    float speech_end_time = 0;     // estimate, see OnlineRecognizerResult
+  };
+  EndpointInfo GetEndpointInfo(OnlineStream *s) const;
 
   // Clear the state of this stream. If IsEndpoint(s) returns true,
   // after calling this function, IsEndpoint(s) will return false

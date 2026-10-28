@@ -55,6 +55,13 @@ class OnlineRecognizerImpl {
 
   virtual bool IsEndpoint(OnlineStream *s) const = 0;
 
+  // Which rule fired and when; the default (no information) is used by models
+  // that do not implement it.
+  virtual OnlineRecognizer::EndpointInfo GetEndpointInfo(
+      OnlineStream * /*s*/) const {
+    return {};
+  }
+
   virtual void Reset(OnlineStream *s) const = 0;
 
   std::string ApplyInverseTextNormalization(std::string text) const;

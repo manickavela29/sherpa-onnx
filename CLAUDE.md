@@ -36,6 +36,19 @@ make -j$(nproc)
 - `cmake/` holds per-dependency fetch scripts (onnxruntime, kaldi-native-fbank, etc.); dependencies are downloaded at configure time.
 - `scripts/` contains per-model export/conversion scripts (not part of the build); `.github/workflows/` has the large CI matrix (per-platform builds, per-language tests, model export).
 
+## Endpoint diagnostics (optional engine metrics)
+
+`--endpoint-diagnostics` (default off, a field of `OnlineRecognizerConfig`, read by the online websocket server) adds endpoint fields to every JSON result so that clients and benchmarks can see which endpoint rule fired and when. With the flag off the JSON is byte-for-byte what it was before. Only transducer models implement it; other models never report an endpoint rule.
+
+| field | meaning |
+|---|---|
+| `endpoint_rule` | `0` not an endpoint, `1` blank-based (rule1, rule2 or rule3). Same encoding as `scripts/test_stream_asr_client_engine.py` in `ds-e2e-asr-testing` (which also reserves `4` for VAD endpoints; this engine has none) |
+| `endpoint_rule_id` | `0` none, `1` rule1 (2.4 s of trailing silence, nothing decoded needed), `2` rule2 (1.2 s of trailing silence after decoding something), `3` rule3 (utterance length, 20 s by default). The first rule that is activated in the order rule1, rule2, rule3 |
+| `endpoint_time` | only when `endpoint_rule` is not 0: audio time in seconds, on the stream's clock (the clock of `start_time`), at which the endpoint was decided = `(frames of earlier segments + frames of this segment) x 10 ms` |
+| `speech_end_time` | only when `endpoint_rule` is not 0: an **estimate** of where speech ended = `endpoint_time - num_trailing_blanks x 4 x 10 ms`, i.e. minus the trailing silence that triggered the rule; at least 0 |
+
+Notes: the response for the end-of-stream (`is_eof`) is not an endpoint, so it reports `endpoint_rule` 0 unless an endpoint rule also fired in the same decoding step. The trailing silence is measured in decoder output frames (4 input frames of 10 ms), so times have 10 ms resolution; the engine decides an endpoint only after a decoding step, so the actual response arrives later than `endpoint_time`. `Endpoint::FiredRule()` (`sherpa-onnx/csrc/endpoint.h`) is the rule evaluation; `Endpoint::IsEndpoint()` is unchanged in behavior. The server reads the values through `OnlineRecognizer::GetEndpointInfo()` **before** `Reset()`, which restarts the segment counters. Tests: `endpoint-test.cc`, and the endpoint cases in `recognizer-result-json-test.cc`.
+
 ## Default engine config (EN streaming model, no VAD)
 
 Whenever a task refers to "the base config" / "default config" for running the sherpa engine, use the values below. They come from `/mnt/efs/manickavela/asr_work/refactor_vad/ds-k2-sherpa-onnx/start_e2e_engine.sh` (defaults with `VAD` unset). Re-check that script if in doubt; it is the source of truth.

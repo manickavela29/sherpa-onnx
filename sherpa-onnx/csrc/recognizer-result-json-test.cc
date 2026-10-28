@@ -118,5 +118,54 @@ TEST(RecognizerResultJson, EmptyResults) {
   EXPECT_FALSE(offline.contains("segment_texts"));
 }
 
+TEST(RecognizerResultJson, EndpointDiagnosticsAreOffByDefault) {
+  OnlineRecognizerResult result;
+  result.text = "hello world";
+  result.is_final = true;
+  // ignored unless endpoint_diagnostics is true
+  result.endpoint_rule_id = 2;
+  result.endpoint_time = 20;
+  result.speech_end_time = 18.8;
+
+  auto json = nlohmann::json::parse(result.AsJsonString());
+  EXPECT_FALSE(json.contains("endpoint_rule"));
+  EXPECT_FALSE(json.contains("endpoint_rule_id"));
+  EXPECT_FALSE(json.contains("endpoint_time"));
+  EXPECT_FALSE(json.contains("speech_end_time"));
+
+  // the only difference between diagnostics off and on is an appended suffix
+  std::string off = result.AsJsonString();
+  result.endpoint_diagnostics = true;
+  std::string on = result.AsJsonString();
+  EXPECT_EQ(on.substr(0, off.size() - 1), off.substr(0, off.size() - 1));
+}
+
+TEST(RecognizerResultJson, EndpointDiagnosticsForAnEndpoint) {
+  OnlineRecognizerResult result;
+  result.endpoint_diagnostics = true;
+
+  // not an endpoint: rule 0 and no times
+  auto json = nlohmann::json::parse(result.AsJsonString());
+  EXPECT_EQ(json["endpoint_rule"], 0);
+  EXPECT_EQ(json["endpoint_rule_id"], 0);
+  EXPECT_FALSE(json.contains("endpoint_time"));
+  EXPECT_FALSE(json.contains("speech_end_time"));
+
+  // an endpoint: endpoint_rule is 1 (blank-based) for rule1, rule2 and rule3,
+  // endpoint_rule_id tells them apart
+  for (int32_t id : {1, 2, 3}) {
+    result.is_final = true;
+    result.endpoint_rule_id = id;
+    result.endpoint_time = 20;
+    result.speech_end_time = 18.75;
+    json = nlohmann::json::parse(result.AsJsonString());
+    EXPECT_EQ(json["endpoint_rule"], 1) << id;
+    EXPECT_EQ(json["endpoint_rule_id"], id);
+    EXPECT_DOUBLE_EQ(json["endpoint_time"].get<double>(), 20.0);
+    EXPECT_NEAR(json["speech_end_time"].get<double>(), 18.75, 0.006);
+    EXPECT_EQ(json["is_final"], true);
+  }
+}
+
 }  // namespace
 }  // namespace sherpa_onnx

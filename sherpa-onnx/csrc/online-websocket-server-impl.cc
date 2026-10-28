@@ -3,7 +3,6 @@
 // Copyright (c)  2022-2023  Xiaomi Corporation
 
 #include "sherpa-onnx/csrc/online-websocket-server-impl.h"
-#include "sherpa-onnx/csrc/macros.h"
 
 #include <iostream>
 #include <memory>
@@ -13,6 +12,7 @@
 
 #include "sherpa-onnx/csrc/file-utils.h"
 #include "sherpa-onnx/csrc/log.h"
+#include "sherpa-onnx/csrc/macros.h"
 
 namespace sherpa_onnx {
 
@@ -214,8 +214,17 @@ void OnlineWebsocketDecoder::Decode() {
 
   for (auto c : c_vec) {
     auto result = recognizer_->GetResult(c->s.get());
+    result.endpoint_diagnostics =
+        config_.recognizer_config.endpoint_diagnostics;
     if (recognizer_->IsEndpoint(c->s.get())) {
       result.is_final = true;
+      if (result.endpoint_diagnostics) {
+        // must be read before Reset(), which restarts the segment counters
+        auto info = recognizer_->GetEndpointInfo(c->s.get());
+        result.endpoint_rule_id = info.rule_id;
+        result.endpoint_time = info.endpoint_time;
+        result.speech_end_time = info.speech_end_time;
+      }
       recognizer_->Reset(c->s.get());
     }
 

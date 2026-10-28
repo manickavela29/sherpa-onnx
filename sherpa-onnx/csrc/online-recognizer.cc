@@ -81,6 +81,17 @@ std::string OnlineRecognizerResult::AsJsonString() const {
      << ", ";
   os << "\"is_final\": " << (is_final ? "true" : "false") << ", ";
   os << "\"is_eof\": " << (is_eof ? "true" : "false");
+  if (endpoint_diagnostics) {
+    // endpoint_rule uses the encoding of the ds-e2e-asr-testing engine client:
+    // 0 none, 1 blank-based (rule1/rule2/rule3), 4 VAD. The finer
+    // endpoint_rule_id tells rule1/rule2/rule3 apart.
+    os << ", \"endpoint_rule\": " << (endpoint_rule_id > 0 ? 1 : 0) << ", ";
+    os << "\"endpoint_rule_id\": " << endpoint_rule_id;
+    if (endpoint_rule_id > 0) {
+      os << ", \"endpoint_time\": " << endpoint_time << ", ";
+      os << "\"speech_end_time\": " << speech_end_time;
+    }
+  }
   os << "}";
   return os.str();
 }
@@ -95,6 +106,10 @@ void OnlineRecognizerConfig::Register(ParseOptions *po) {
 
   po->Register("enable-endpoint", &enable_endpoint,
                "True to enable endpoint detection. False to disable it.");
+  po->Register("endpoint-diagnostics", &endpoint_diagnostics,
+               "True to add endpoint_rule, endpoint_rule_id, endpoint_time and "
+               "speech_end_time to each result of the websocket server. "
+               "Diagnostic only; the default output is unchanged.");
   po->Register("max-active-paths", &max_active_paths,
                "beam size used in modified beam search.");
   po->Register("blank-penalty", &blank_penalty,
@@ -205,6 +220,8 @@ std::string OnlineRecognizerConfig::ToString() const {
   os << "endpoint_config=" << endpoint_config.ToString() << ", ";
   os << "ctc_fst_decoder_config=" << ctc_fst_decoder_config.ToString() << ", ";
   os << "enable_endpoint=" << (enable_endpoint ? "True" : "False") << ", ";
+  os << "endpoint_diagnostics=" << (endpoint_diagnostics ? "True" : "False")
+     << ", ";
   os << "max_active_paths=" << max_active_paths << ", ";
   os << "hotwords_score=" << hotwords_score << ", ";
   os << "hotwords_file=\"" << hotwords_file << "\", ";
@@ -261,6 +278,11 @@ OnlineRecognizerResult OnlineRecognizer::GetResult(OnlineStream *s) const {
 
 bool OnlineRecognizer::IsEndpoint(OnlineStream *s) const {
   return impl_->IsEndpoint(s);
+}
+
+OnlineRecognizer::EndpointInfo OnlineRecognizer::GetEndpointInfo(
+    OnlineStream *s) const {
+  return impl_->GetEndpointInfo(s);
 }
 
 void OnlineRecognizer::Reset(OnlineStream *s) const { impl_->Reset(s); }

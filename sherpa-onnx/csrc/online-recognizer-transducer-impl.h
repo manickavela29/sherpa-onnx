@@ -389,6 +389,38 @@ class OnlineRecognizerTransducerImpl : public OnlineRecognizerImpl {
                                 frame_shift_in_seconds);
   }
 
+  OnlineRecognizer::EndpointInfo GetEndpointInfo(
+      OnlineStream *s) const override {
+    OnlineRecognizer::EndpointInfo info;
+    if (!config_.enable_endpoint) {
+      return info;
+    }
+
+    // Same quantities as IsEndpoint(): frames are 10 ms apart, the model's
+    // output frame is 4 input frames
+    const float frame_shift_in_seconds = 0.01;
+    int32_t num_processed_frames = s->GetNumProcessedFrames();
+    int32_t trailing_silence_frames = s->GetResult().num_trailing_blanks * 4;
+
+    info.rule_id = endpoint_.FiredRule(
+        num_processed_frames, trailing_silence_frames, frame_shift_in_seconds);
+    if (info.rule_id == 0) {
+      return info;
+    }
+
+    // GetNumProcessedFrames() counts the frames of the current segment only
+    // (it is reset by Reset()); the frames of earlier segments are in
+    // GetNumFramesSinceStart(), the same value that gives `start_time`.
+    info.endpoint_time = (s->GetNumFramesSinceStart() + num_processed_frames) *
+                         frame_shift_in_seconds;
+    info.speech_end_time =
+        info.endpoint_time - trailing_silence_frames * frame_shift_in_seconds;
+    if (info.speech_end_time < 0) {
+      info.speech_end_time = 0;
+    }
+    return info;
+  }
+
   void Reset(OnlineStream *s) const override {
     int32_t context_size = model_->ContextSize();
 
