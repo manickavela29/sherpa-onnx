@@ -107,6 +107,7 @@ set(sources
   online-nemo-ctc-model.cc
   online-paraformer-model-config.cc
   online-paraformer-model.cc
+  online-endpoint-profile.cc
   online-recognizer-impl.cc
   online-recognizer.cc
   online-rnn-lm.cc
@@ -123,6 +124,9 @@ set(sources
   online-transducer-modified-beam-search-nemo-decoder.cc
   online-transducer-nemo-parakeet-unified-model.cc
   online-transducer-nemo-model.cc
+  online-silero-vad.cc
+  online-vad-model-config.cc
+  online-vad-model.cc
   online-wenet-ctc-model-config.cc
   online-wenet-ctc-model.cc
   online-zipformer-transducer-model.cc
