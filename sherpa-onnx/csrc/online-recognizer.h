@@ -22,6 +22,8 @@
 
 namespace sherpa_onnx {
 
+class OnlineVadModel;
+
 struct OnlineRecognizerResult {
   /// Recognition results.
   /// For English, it consists of space separated words.
@@ -225,14 +227,21 @@ class OnlineRecognizer {
    */
   bool IsReady(OnlineStream *s) const;
 
-  /** Runs one VAD processing step for each of the given streams --
-   * mirrors DecodeStreams()'s shape but drives the independent VAD
-   * pipeline instead of ASR decoding. Call this from your own schedule
-   * (the websocket server calls it from a dedicated, faster-cadence
-   * timer, running ahead of the ASR decode loop); it is never called
-   * automatically. A no-op for streams without VAD configured.
+  /** Scores the pending audio of the given streams with the shared VAD
+   * model (batched) -- mirrors DecodeStreams()'s shape but drives the
+   * independent VAD pipeline. Call it from your own schedule; it is never
+   * called automatically. A no-op without VAD. A stream whose end of
+   * speech is confirmed comes back with IsVadFlushPending() set.
    */
   void VadProcess(OnlineStream **ss, int32_t n) const;
+
+  /** True if DecodeStreams() can run on `s` right now. Unlike IsReady(), it
+   * has no side effects.
+   */
+  bool IsDecodable(OnlineStream *s) const;
+
+  /** True if `s` holds a full VAD window that VadProcess() would score. */
+  bool VadHasWindow(OnlineStream *s) const;
 
   /** Decode a single stream. */
   void DecodeStream(OnlineStream *s) const {
@@ -276,9 +285,14 @@ class OnlineRecognizer {
   void MaybeSkipVadSilence(OnlineStream *s) const;
 
  private:
+  // Enables VAD on `s`; the model itself is shared.
+  void InitStreamVad(OnlineStream *s) const;
+
   std::unique_ptr<OnlineRecognizerImpl> impl_;
   OnlineVadModelConfig online_vad_config_;
   float asr_frame_shift_ms_ = 10.0f;
+  // Shared by all streams; null when disabled.
+  std::unique_ptr<OnlineVadModel> vad_model_;
 };
 
 }  // namespace sherpa_onnx

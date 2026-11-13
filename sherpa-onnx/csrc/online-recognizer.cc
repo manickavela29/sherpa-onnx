@@ -24,7 +24,9 @@
 #endif
 
 #include "sherpa-onnx/csrc/file-utils.h"
+#include "sherpa-onnx/csrc/online-endpoint-profile.h"
 #include "sherpa-onnx/csrc/online-recognizer-impl.h"
+#include "sherpa-onnx/csrc/online-vad-model.h"
 #include "sherpa-onnx/csrc/text-utils.h"
 
 namespace sherpa_onnx {
@@ -234,43 +236,64 @@ std::string OnlineRecognizerConfig::ToString() const {
 OnlineRecognizer::OnlineRecognizer(const OnlineRecognizerConfig &config)
     : impl_(OnlineRecognizerImpl::Create(config)),
       online_vad_config_(config.online_vad_config),
-      asr_frame_shift_ms_(config.feat_config.frame_shift_ms) {}
+      asr_frame_shift_ms_(config.feat_config.frame_shift_ms),
+      vad_model_(OnlineVadModel::Create(config.online_vad_config)) {}
 
 template <typename Manager>
 OnlineRecognizer::OnlineRecognizer(Manager *mgr,
                                    const OnlineRecognizerConfig &config)
     : impl_(OnlineRecognizerImpl::Create(mgr, config)),
       online_vad_config_(config.online_vad_config),
-      asr_frame_shift_ms_(config.feat_config.frame_shift_ms) {}
+      asr_frame_shift_ms_(config.feat_config.frame_shift_ms),
+      vad_model_(OnlineVadModel::Create(config.online_vad_config)) {}
 
 OnlineRecognizer::~OnlineRecognizer() = default;
 
 std::unique_ptr<OnlineStream> OnlineRecognizer::CreateStream() const {
   auto s = impl_->CreateStream();
-  if (online_vad_config_.IsEnabled()) {
-    s->InitVad(online_vad_config_.ToVadModelConfig(), asr_frame_shift_ms_);
-  }
+  InitStreamVad(s.get());
   return s;
 }
 
 std::unique_ptr<OnlineStream> OnlineRecognizer::CreateStream(
     const std::string &hotwords) const {
   auto s = impl_->CreateStream(hotwords);
-  if (online_vad_config_.IsEnabled()) {
-    s->InitVad(online_vad_config_.ToVadModelConfig(), asr_frame_shift_ms_);
-  }
+  InitStreamVad(s.get());
   return s;
 }
 
+void OnlineRecognizer::InitStreamVad(OnlineStream *s) const {
+  if (!vad_model_) return;
+  // Decoders without chunk geometry cannot flush.
+  const bool flush_supported = impl_->GetChunkSizeForVad() > 0;
+  s->InitVad(vad_model_->SampleRate(), vad_model_->WindowShift(),
+             vad_model_->WindowSize(), asr_frame_shift_ms_, flush_supported);
+}
+
 void OnlineRecognizer::VadProcess(OnlineStream **ss, int32_t n) const {
-  for (int32_t i = 0; i != n; ++i) {
-    if (ss[i]->HasVad()) {
-      ss[i]->VadProcessStep();
-    }
-  }
+  if (!vad_model_) return;
+  vad_model_->RunVad(ss, n);
+}
+
+bool OnlineRecognizer::IsDecodable(OnlineStream *s) const {
+  if (s->HasVad() && s->IsVadFlushPending()) return true;
+  return impl_->IsReady(s);
+}
+
+bool OnlineRecognizer::VadHasWindow(OnlineStream *s) const {
+  return vad_model_ && s->VadPendingSize() >= vad_model_->WindowSize();
 }
 
 bool OnlineRecognizer::IsReady(OnlineStream *s) const {
+  if (s->HasVad() && s->IsVadFlushPending()) {
+    // VAD-confirmed end of speech: decode what is left now (DecodeStreams()
+    // pads the last chunk with silence), without the VAD coverage gate.
+    int32_t chunk_size = impl_->GetChunkSizeForVad();
+    int32_t remaining = s->GetVadEndpointFrame() - s->GetNumProcessedFrames();
+    if (remaining <= chunk_size) return true;
+    return s->GetNumProcessedFrames() + chunk_size < s->NumFramesReady();
+  }
+
   bool ready = impl_->IsReady(s);
   if (!ready || !s->HasVad() || s->IsInputFinished()) {
     return ready;
@@ -305,11 +328,19 @@ bool OnlineRecognizer::IsReady(OnlineStream *s) const {
 
   int64_t target = static_cast<int64_t>(s->GetNumFramesSinceStart()) +
                    s->GetNumProcessedFrames() + chunk_size;
-  return s->GetVadFramesCoveredAbsolute() >= target;
+  int64_t covered = s->GetVadFramesCoveredAbsolute();
+  bool vad_ok = covered >= target;
+  s->ProfReadyBlocked(!vad_ok, target - covered);
+  return vad_ok;
 }
 
 void OnlineRecognizer::MaybeSkipVadSilence(OnlineStream *s) const {
   if (!s->HasVad() || s->IsInputFinished() || !online_vad_config_.batch_skip) {
+    return;
+  }
+
+  // Frames up to an armed endpoint belong to the flush.
+  if (s->IsVadEndpointArmed()) {
     return;
   }
 
@@ -324,6 +355,7 @@ void OnlineRecognizer::MaybeSkipVadSilence(OnlineStream *s) const {
     return;
   }
   int64_t vad_covered = s->GetVadFramesCoveredAbsolute();
+  const int32_t prof_start = s->GetNumProcessedFrames();
 
   while (true) {
     int32_t local_processed = s->GetNumProcessedFrames();
@@ -347,11 +379,19 @@ void OnlineRecognizer::MaybeSkipVadSilence(OnlineStream *s) const {
     }
     s->GetNumProcessedFrames() += chunk_shift;
   }
+
+  if (epprof::Enabled() && s->GetNumProcessedFrames() > prof_start) {
+    epprof::Log(epprof::Ev::kVadSkip, s->Id(),
+                s->GetNumProcessedFrames() - prof_start);
+  }
 }
 
 void OnlineRecognizer::WarmpUpRecognizer(int32_t warmup, int32_t mbs) const {
   if (warmup > 0) {
     impl_->WarmpUpRecognizer(warmup, mbs);
+    if (vad_model_) {
+      vad_model_->WarmUp(warmup);
+    }
   }
 }
 

@@ -36,6 +36,9 @@ struct Connection {
   // set it to true when InputFinished() is called
   bool eof = false;
 
+  // endpoint-latency profiling only (guarded by `mutex`)
+  bool prof_open_logged = false;
+
   // The last time we received a message from the client
   // TODO(fangjun): Use it to disconnect from a client if it is inactive
   // for a specified time.
@@ -76,7 +79,7 @@ struct OnlineWebsocketDecoderConfig {
   // timer is armed at all.
   int32_t vad_loop_interval_ms = 2;
 
-  int32_t max_vad_batch_size = 32;
+  int32_t max_vad_batch_size = 64;
 
   void Register(ParseOptions *po);
   void Validate() const;
@@ -126,6 +129,9 @@ class OnlineWebsocketDecoder {
   void VadDecode();
 
  private:
+  // Queues streams with a pending VAD flush for an immediate Decode().
+  void ScheduleVadFlushes(const std::vector<std::shared_ptr<Connection>> &cs);
+
   OnlineWebsocketServer *server_;  // not owned
   std::unique_ptr<OnlineRecognizer> recognizer_;
   OnlineWebsocketDecoderConfig config_;

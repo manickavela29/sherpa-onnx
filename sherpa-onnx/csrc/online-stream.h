@@ -17,7 +17,6 @@
 #include "sherpa-onnx/csrc/online-paraformer-decoder.h"
 #include "sherpa-onnx/csrc/online-stream-state.h"
 #include "sherpa-onnx/csrc/online-transducer-decoder.h"
-#include "sherpa-onnx/csrc/vad-model-config.h"
 
 namespace sherpa_onnx {
 
@@ -76,6 +75,10 @@ class OnlineStream {
   int32_t &GetNumProcessedFrames();  // It's reset after calling Reset()
 
   int32_t GetNumFramesSinceStart() const;
+
+  // Stream id and profiling hook (see online-endpoint-profile.h).
+  int64_t Id() const;
+  void ProfReadyBlocked(bool blocked, int64_t deficit_frames);
 
   int32_t &GetCurrentSegment();
 
@@ -146,22 +149,34 @@ class OnlineStream {
   // prediction buffer the ASR side polls for coverage, written by a VAD
   // step the ASR side never calls itself.
 
-  // Creates the independent VAD pipeline for this stream from
-  // `vad_config` (`vad_config.silero_vad.model` must be non-empty).
-  // `asr_frame_shift_ms` is the ASR feature pipeline's frame shift, used
-  // to convert VAD-buffer frame counts into ASR-frame-equivalent units
-  // for the coverage gate and batch-skip.
-  void InitVad(const VadModelConfig &vad_config, float asr_frame_shift_ms);
+  // Enables VAD on this stream; the model is shared, the stream keeps its
+  // own state. `window_shift`/`window_size` are in samples at
+  // `vad_sample_rate`. `flush_supported`: the decoder can run the
+  // end-of-utterance flush (see IsVadFlushPending()).
+  void InitVad(int32_t vad_sample_rate, int32_t window_shift,
+               int32_t window_size, float asr_frame_shift_ms,
+               bool flush_supported);
 
   // True if InitVad() was called on this stream.
   bool HasVad() const;
 
-  // Runs one VAD processing step: drains whatever raw audio has been
-  // copied since the last call, runs Silero inference window-by-window,
-  // and pushes one prediction per window into this stream's
-  // OnlineVadBuffer. Called by OnlineRecognizer::VadProcess(), never
-  // from AcceptWaveform() itself.
-  void VadProcessStep();
+  // ---- used by the shared OnlineVadModel (VAD thread) ----
+  // Raw samples (VAD sample rate) not yet scored.
+  int32_t VadPendingSize() const;
+  // Copies the first `win` pending samples; false if fewer are buffered.
+  bool VadPeekWindow(int32_t win, std::vector<float> *out) const;
+  // Drops `k` scored samples from the front.
+  void VadDropSamples(int32_t k);
+  // Records one window's decision. On a confirmed speech -> silence flip
+  // this arms the endpoint and the end-of-utterance flush.
+  void VadPushPrediction(bool is_speech);
+  // Model state kept per stream (LSTM state and state-machine counters).
+  std::vector<Ort::Value> &GetVadStates();
+  void SetVadStates(std::vector<Ort::Value> states);
+  bool &IsVadTriggered();
+  int32_t &GetVadCurrentSample();
+  int32_t &GetVadTempStart();
+  int32_t &GetVadTempEnd();
 
   // Total ASR-feature-frame-equivalent audio the VAD buffer has actually
   // scored so far, in the same absolute frame space as
@@ -178,12 +193,24 @@ class OnlineStream {
   // speech (sticky through its own min-silence-duration hangover).
   bool IsVadSpeechDetected() const;
 
-  // True once this stream has seen speech and the VAD buffer has since
-  // observed enough trailing silence (min_silence_duration) to end it.
+  // True once the VAD confirmed the end of speech AND the end-of-utterance
+  // flush (if any) has been decoded: the endpoint can be reported.
   bool IsVadEndpoint() const;
 
-  // Clears the "seen speech this segment" bookkeeping. Does not drop the
-  // VAD buffer's own continuous state.
+  // True from when the VAD arms the endpoint until ResetVad().
+  bool IsVadEndpointArmed() const;
+
+  // True while the end-of-utterance flush chunk is still to be decoded.
+  bool IsVadFlushPending() const;
+
+  // ASR-relative frame (same space as GetNumProcessedFrames()) the flush
+  // must decode up to.
+  int32_t GetVadEndpointFrame() const;
+
+  void ClearVadFlushPending();
+
+  // Clears the per-segment VAD bookkeeping (seen speech, endpoint, flush).
+  // Does not drop the VAD buffer's own continuous state.
   void ResetVad();
 
   // True once InputFinished() has been called on this stream.
